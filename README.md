@@ -15,6 +15,7 @@ Claude Code  →  Anthropic API (localhost:8082)  →  GitHub Copilot API
 3. The proxy authenticates with GitHub Copilot and forwards requests appropriately:
    - **Claude models** → direct passthrough to Copilot's `/v1/messages` endpoint (no conversion needed)
    - **Other models** (GPT-4o, etc.) → converted from Anthropic format to OpenAI format and sent to `/chat/completions`
+   - **Codex / Responses API clients** → passthrough via `/v1/responses`
 
 ## Authentication Flow
 
@@ -110,6 +111,7 @@ The header strip also provides one-click copy of the Claude Code configuration c
 | `GET /health` | Health check |
 | `GET /v1/models` | List available models (Anthropic format) |
 | `POST /v1/messages` | Main proxy endpoint (Anthropic format) |
+| `POST /v1/responses` | OpenAI Responses API endpoint for Codex |
 | `GET /v1/models/refresh` | Force refresh model list |
 | `GET /audit/sessions` | List all audit session files |
 | `GET /audit/current` | Current session audit log (JSON) |

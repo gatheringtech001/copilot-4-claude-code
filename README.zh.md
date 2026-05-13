@@ -15,6 +15,7 @@ Claude Code  →  Anthropic API (localhost:8082)  →  GitHub Copilot API
 3. 代理完成认证后将请求转发给 GitHub Copilot：
    - **Claude 模型** → 直接透传到 Copilot 的 `/v1/messages` 接口（无需格式转换）
    - **其他模型**（GPT-4o 等）→ 从 Anthropic 格式转换为 OpenAI 格式，发送到 `/chat/completions`
+   - **Codex / Responses API 客户端** → 通过 `/v1/responses` 透传
 
 ## 认证流程
 
@@ -110,6 +111,7 @@ ANTHROPIC_BASE_URL=http://127.0.0.1:8082 ANTHROPIC_AUTH_TOKEN=dummy claude
 | `GET /health` | 健康检查 |
 | `GET /v1/models` | 获取可用模型列表（Anthropic 格式） |
 | `POST /v1/messages` | 主代理接口（Anthropic 格式） |
+| `POST /v1/responses` | 面向 Codex 的 OpenAI Responses API 接口 |
 | `GET /v1/models/refresh` | 强制刷新模型列表 |
 | `GET /audit/sessions` | 列出所有审计 session 文件 |
 | `GET /audit/current` | 当前 session 审计日志（JSON） |

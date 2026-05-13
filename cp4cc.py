@@ -436,11 +436,157 @@ def anthropic_to_openai(body: dict, mapped_model: str) -> dict:
         messages.append({"role": role, "content": content})
 
     result: dict = {"model": mapped_model, "messages": messages}
-    for key in ("max_tokens", "stream", "temperature", "top_p", "stop"):
+
+    # Claude Code speaks Anthropic and sends max_tokens. Newer Copilot GPT/o-series
+    # chat-completions models reject max_tokens and require max_completion_tokens.
+    # Keep Claude models on /v1/messages untouched; this conversion is only for
+    # non-Claude models routed to /chat/completions.
+    if "max_tokens" in body:
+        result["max_completion_tokens"] = body["max_tokens"]
+
+    for key in ("stream", "temperature", "top_p", "stop"):
         if key in body:
             result[key] = body[key]
     # top_k is Anthropic-specific, do not pass to OpenAI
     return result
+
+
+def _responses_content_to_text(content) -> str:
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        parts = []
+        for item in content:
+            if isinstance(item, str):
+                parts.append(item)
+            elif isinstance(item, dict):
+                typ = item.get("type")
+                if typ in ("input_text", "output_text", "text"):
+                    parts.append(item.get("text", ""))
+        return "".join(parts)
+    return ""
+
+
+def responses_to_openai_chat(body: dict, mapped_model: str) -> dict:
+    messages = []
+
+    if instructions := body.get("instructions"):
+        messages.append({"role": "system", "content": str(instructions)})
+
+    input_value = body.get("input", "")
+    if isinstance(input_value, str):
+        messages.append({"role": "user", "content": input_value})
+    elif isinstance(input_value, list):
+        for item in input_value:
+            if isinstance(item, str):
+                messages.append({"role": "user", "content": item})
+            elif isinstance(item, dict):
+                typ = item.get("type")
+                if typ == "message" or "role" in item:
+                    role = item.get("role", "user")
+                    if role not in ("system", "user", "assistant", "tool"):
+                        role = "user"
+                    messages.append({
+                        "role": role,
+                        "content": _responses_content_to_text(item.get("content", "")),
+                    })
+                elif typ in ("input_text", "text"):
+                    messages.append({"role": "user", "content": item.get("text", "")})
+                elif typ == "function_call_output":
+                    messages.append({
+                        "role": "tool",
+                        "tool_call_id": item.get("call_id", "call_0"),
+                        "content": _responses_content_to_text(item.get("output", "")),
+                    })
+
+    result: dict = {"model": mapped_model, "messages": messages}
+    if "max_output_tokens" in body:
+        result["max_completion_tokens"] = body["max_output_tokens"]
+    if "max_completion_tokens" in body:
+        result["max_completion_tokens"] = body["max_completion_tokens"]
+    for key in ("stream", "temperature", "top_p", "stop"):
+        if key in body:
+            result[key] = body[key]
+    if "tools" in body:
+        result["tools"] = body["tools"]
+    if "tool_choice" in body:
+        result["tool_choice"] = body["tool_choice"]
+    return result
+
+
+def _responses_usage(openai_usage: dict) -> dict:
+    input_tokens = openai_usage.get("prompt_tokens", openai_usage.get("input_tokens", 0)) or 0
+    output_tokens = openai_usage.get("completion_tokens", openai_usage.get("output_tokens", 0)) or 0
+    return {
+        "input_tokens": input_tokens,
+        "output_tokens": output_tokens,
+        "total_tokens": openai_usage.get("total_tokens", input_tokens + output_tokens) or 0,
+    }
+
+
+def openai_chat_to_responses(openai_resp: dict, response_id: str | None = None) -> dict:
+    choice = openai_resp.get("choices", [{}])[0]
+    message = choice.get("message", {}) or {}
+    text = message.get("content") or ""
+    rid = response_id or openai_resp.get("id") or f"resp_{uuid4().hex[:24]}"
+    output_item = {
+        "id": f"msg_{uuid4().hex[:24]}",
+        "type": "message",
+        "status": "completed",
+        "role": "assistant",
+        "content": [{"type": "output_text", "text": text}],
+    }
+    return {
+        "id": rid,
+        "object": "response",
+        "created_at": int(time.time()),
+        "status": "completed",
+        "error": None,
+        "model": openai_resp.get("model", "unknown"),
+        "output": [output_item],
+        "output_text": text,
+        "usage": _responses_usage(openai_resp.get("usage", {})),
+    }
+
+
+async def stream_openai_to_responses(openai_stream: httpx.Response, response_id: str, model: str) -> AsyncIterator[str]:
+    yield f"event: response.created\ndata: {json.dumps({'type':'response.created','response':{'id':response_id,'model':model,'status':'in_progress'}})}\n\n"
+    item_id = f"msg_{uuid4().hex[:24]}"
+    yield f"event: response.output_item.added\ndata: {json.dumps({'type':'response.output_item.added','output_index':0,'item':{'id':item_id,'type':'message','status':'in_progress','role':'assistant','content':[]}})}\n\n"
+    text_parts = []
+    usage = {}
+    async for line in openai_stream.aiter_lines():
+        if not line.startswith("data: "):
+            continue
+        data_str = line[6:]
+        if data_str == "[DONE]":
+            break
+        try:
+            chunk = json.loads(data_str)
+        except json.JSONDecodeError:
+            continue
+        if chunk.get("usage"):
+            usage = chunk["usage"]
+        choice = (chunk.get("choices") or [{}])[0]
+        delta = choice.get("delta", {}) or {}
+        text = delta.get("content") or ""
+        if text:
+            text_parts.append(text)
+            yield f"event: response.output_text.delta\ndata: {json.dumps({'type':'response.output_text.delta','delta':text})}\n\n"
+    full_text = "".join(text_parts)
+    yield f"event: response.output_item.done\ndata: {json.dumps({'type':'response.output_item.done','output_index':0,'item':{'id':item_id,'type':'message','status':'completed','role':'assistant','content':[{'type':'output_text','text':full_text}]}})}\n\n"
+    completed = {
+        "type": "response.completed",
+        "response": {
+            "id": response_id,
+            "model": model,
+            "status": "completed",
+            "output": [{"id": item_id, "type": "message", "status": "completed", "role": "assistant", "content": [{"type": "output_text", "text": full_text}]}],
+            "output_text": full_text,
+            "usage": _responses_usage(usage),
+        },
+    }
+    yield f"event: response.completed\ndata: {json.dumps(completed)}\n\n"
 
 
 def openai_to_anthropic(openai_resp: dict) -> dict:
@@ -529,6 +675,89 @@ async def list_models():
     }
 
 
+@app.post("/v1/responses")
+async def responses(request: Request):
+    req_id = str(uuid4())
+    t_start = time.monotonic()
+    try:
+        body = await request.json()
+    except json.JSONDecodeError as e:
+        logger.warning("Invalid Responses JSON request req=%s: %s", req_id[:8], e)
+        raise HTTPException(status_code=400, detail="Invalid JSON body.")
+
+    original_model: str = body.get("model", "")
+    copilot_model = map_model_name(original_model)
+    forward_body = {**body, "model": copilot_model}
+
+    try:
+        api_key = get_api_key()
+    except Exception as e:
+        logger.error("Authentication failed req=%s: %s", req_id[:8], e)
+        audit_log(req_id, body, copilot_model, "responses-auth", None, 401, 0, str(e))
+        raise HTTPException(status_code=401, detail=f"GitHub Copilot authentication failed: {e}")
+
+    api_base = get_api_base()
+    copilot_headers = get_copilot_headers(api_key)
+    endpoint = "/v1/responses"
+    is_stream = forward_body.get("stream", False)
+    url = f"{api_base}{endpoint}"
+
+    logger.debug(
+        "responses req=%s model=%s→%s endpoint=%s stream=%s",
+        req_id[:8], original_model, copilot_model, endpoint, is_stream,
+    )
+
+    if is_stream:
+        async def generate():
+            nonlocal t_start
+            error_msg = None
+            status = 200
+            try:
+                async with httpx.AsyncClient(timeout=120) as client:
+                    async with client.stream("POST", url, headers=copilot_headers, json=forward_body) as resp:
+                        status = resp.status_code
+                        if status != 200:
+                            err = await resp.aread()
+                            error_msg = err.decode()
+                            logger.warning("Upstream %s returned %s: %s", endpoint, status, error_msg[:200])
+                            yield f"event: error\ndata: {json.dumps({'type':'error','error':{'message':error_msg}})}\n\n"
+                        else:
+                            async for line in resp.aiter_lines():
+                                if line:
+                                    yield line + "\n"
+                                else:
+                                    yield "\n"
+            except Exception as e:
+                error_msg = str(e)
+                logger.error("Responses streaming request error req=%s: %s", req_id[:8], e)
+            duration = (time.monotonic() - t_start) * 1000
+            audit_log(req_id, body, copilot_model, "/v1/responses", {"stream": True}, status, duration, error_msg)
+
+        return StreamingResponse(
+            generate(),
+            media_type="text/event-stream",
+            headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+        )
+
+    try:
+        async with httpx.AsyncClient(timeout=120) as client:
+            resp = await client.post(url, headers=copilot_headers, json=forward_body)
+    except Exception as e:
+        duration = (time.monotonic() - t_start) * 1000
+        audit_log(req_id, body, copilot_model, "/v1/responses", None, 500, duration, str(e))
+        raise HTTPException(status_code=500, detail=str(e))
+
+    duration = (time.monotonic() - t_start) * 1000
+    if resp.status_code != 200:
+        logger.warning("Upstream %s returned %s: %s", endpoint, resp.status_code, resp.text[:300])
+        audit_log(req_id, body, copilot_model, "/v1/responses", resp.text[:500], resp.status_code, duration, f"upstream {resp.status_code}")
+        raise HTTPException(status_code=resp.status_code, detail=resp.text)
+
+    result = resp.json()
+    audit_log(req_id, body, copilot_model, "/v1/responses", result, 200, duration)
+    return JSONResponse(content=result)
+
+
 @app.post("/v1/messages")
 async def messages(request: Request):
     """
@@ -540,7 +769,17 @@ async def messages(request: Request):
     """
     req_id = str(uuid4())
     t_start = time.monotonic()
-    body = await request.json()
+    try:
+        body = await request.json()
+    except json.JSONDecodeError as e:
+        logger.warning("Invalid JSON request req=%s: %s", req_id[:8], e)
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "Invalid JSON body. If you are using Windows cmd.exe, do not wrap "
+                "JSON with single quotes; use escaped double quotes or --data-binary @body.json."
+            ),
+        )
 
     original_model: str = body.get("model", "")
     copilot_model = map_model_name(original_model)
