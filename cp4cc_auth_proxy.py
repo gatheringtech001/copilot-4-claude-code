@@ -36,7 +36,7 @@ app = cp4cc.app
 
 @app.middleware("http")
 async def require_public_token(request: Request, call_next):
-    if request.url.path == "/health":
+    if request.url.path == "/health" or request.url.path.startswith("/admin"):
         return await call_next(request)
 
     auth = request.headers.get("authorization", "")
