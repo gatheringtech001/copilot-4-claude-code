@@ -15,6 +15,7 @@ Authentication flow:
 """
 
 import argparse
+import asyncio
 import base64
 import hashlib
 import hmac
@@ -523,11 +524,21 @@ def _int_env(name: str, default: int) -> int:
         return default
 
 
+def _float_env(name: str, default: float) -> float:
+    try:
+        value = float(os.environ.get(name, "").strip())
+        return value if value >= 0 else default
+    except ValueError:
+        return default
+
+
 IMAGE_SINGLE_CHAR_LIMIT = _int_env("CP4CC_IMAGE_SINGLE_CHAR_LIMIT", 1_000_000)
 IMAGE_TOTAL_CHAR_LIMIT = _int_env("CP4CC_IMAGE_TOTAL_CHAR_LIMIT", 1_200_000)
 IMAGE_MAX_FORWARDED = _int_env("CP4CC_IMAGE_MAX_FORWARDED", 4)
 IMAGE_ATTACHMENT_DIR = LOGS_DIR / "image_attachments"
 DATA_IMAGE_RE = re.compile(r"^data:(image/[a-zA-Z0-9.+-]+);base64,(.*)$", re.DOTALL)
+UPSTREAM_BUSY_RETRIES = _int_env("CP4CC_UPSTREAM_BUSY_RETRIES", 2)
+UPSTREAM_BUSY_BACKOFF_SECONDS = _float_env("CP4CC_UPSTREAM_BUSY_BACKOFF_SECONDS", 2.0)
 
 
 def _is_data_image_url(value) -> bool:
@@ -1226,6 +1237,21 @@ def is_expired_ide_token_error(status_code: int, body_text: str | None) -> bool:
     return "token expired" in lower and ("ide token" in lower or "unauthorized" in lower)
 
 
+def is_upstream_high_demand_error(status_code: int, body_text: str | None) -> bool:
+    if status_code != 503 or not body_text:
+        return False
+    lower = body_text.lower()
+    return (
+        "high demand" in lower
+        and ("upstream model provider" in lower or "try another model" in lower)
+    )
+
+
+def upstream_busy_retry_delay(retry_number: int) -> float:
+    retry_number = max(1, retry_number)
+    return min(30.0, UPSTREAM_BUSY_BACKOFF_SECONDS * (2 ** (retry_number - 1)))
+
+
 def invalidate_api_key_cache(reason: str) -> None:
     try:
         os.remove(API_KEY_FILE)
@@ -1726,7 +1752,8 @@ async def chat_completions(request: Request):
             error_msg = None
             status = 200
             usage = {}
-            retry_count = 0
+            auth_retry_count = 0
+            busy_retry_count = 0
             target_url = url
             headers = copilot_headers
             try:
@@ -1737,10 +1764,16 @@ async def chat_completions(request: Request):
                             if status != 200:
                                 err = await resp.aread()
                                 error_msg = err.decode()
-                                if retry_count == 0 and is_expired_ide_token_error(status, error_msg):
-                                    retry_count += 1
+                                if auth_retry_count == 0 and is_expired_ide_token_error(status, error_msg):
+                                    auth_retry_count += 1
                                     logger.warning("Upstream %s req=%s returned expired token; refreshing and retrying once", endpoint, req_id[:8])
                                     target_url, headers = refresh_upstream_auth_after_401(req_id, endpoint, error_msg)
+                                    continue
+                                if busy_retry_count < UPSTREAM_BUSY_RETRIES and is_upstream_high_demand_error(status, error_msg):
+                                    busy_retry_count += 1
+                                    delay = upstream_busy_retry_delay(busy_retry_count)
+                                    logger.warning("Upstream %s req=%s returned high demand 503; retrying same model in %.1fs (%d/%d)", endpoint, req_id[:8], delay, busy_retry_count, UPSTREAM_BUSY_RETRIES)
+                                    await asyncio.sleep(delay)
                                     continue
                                 logger.warning("Upstream %s returned %s: %s", endpoint, status, error_msg[:200])
                                 yield f"event: error\ndata: {json.dumps({'type':'error','error':{'message':error_msg}})}\n\n"
@@ -1766,11 +1799,20 @@ async def chat_completions(request: Request):
 
     try:
         async with httpx.AsyncClient(timeout=120) as client:
-            resp = await client.post(url, headers=copilot_headers, json=forward_body)
+            target_url = url
+            headers = copilot_headers
+            resp = await client.post(target_url, headers=headers, json=forward_body)
             if is_expired_ide_token_error(resp.status_code, resp.text):
                 logger.warning("Upstream %s req=%s returned expired token; refreshing and retrying once", endpoint, req_id[:8])
-                retry_url, retry_headers = refresh_upstream_auth_after_401(req_id, endpoint, resp.text)
-                resp = await client.post(retry_url, headers=retry_headers, json=forward_body)
+                target_url, headers = refresh_upstream_auth_after_401(req_id, endpoint, resp.text)
+                resp = await client.post(target_url, headers=headers, json=forward_body)
+            busy_retry_count = 0
+            while busy_retry_count < UPSTREAM_BUSY_RETRIES and is_upstream_high_demand_error(resp.status_code, resp.text):
+                busy_retry_count += 1
+                delay = upstream_busy_retry_delay(busy_retry_count)
+                logger.warning("Upstream %s req=%s returned high demand 503; retrying same model in %.1fs (%d/%d)", endpoint, req_id[:8], delay, busy_retry_count, UPSTREAM_BUSY_RETRIES)
+                await asyncio.sleep(delay)
+                resp = await client.post(target_url, headers=headers, json=forward_body)
     except Exception as e:
         duration = (time.monotonic() - t_start) * 1000
         audit_log(req_id, body, copilot_model, "/v1/chat/completions", None, 500, duration, str(e))
@@ -1834,7 +1876,8 @@ async def responses(request: Request):
             error_msg = None
             status = 200
             usage = {}
-            retry_count = 0
+            auth_retry_count = 0
+            busy_retry_count = 0
             target_url = url
             headers = copilot_headers
             try:
@@ -1845,10 +1888,16 @@ async def responses(request: Request):
                             if status != 200:
                                 err = await resp.aread()
                                 error_msg = err.decode()
-                                if retry_count == 0 and is_expired_ide_token_error(status, error_msg):
-                                    retry_count += 1
+                                if auth_retry_count == 0 and is_expired_ide_token_error(status, error_msg):
+                                    auth_retry_count += 1
                                     logger.warning("Upstream %s req=%s returned expired token; refreshing and retrying once", endpoint, req_id[:8])
                                     target_url, headers = refresh_upstream_auth_after_401(req_id, endpoint, error_msg)
+                                    continue
+                                if busy_retry_count < UPSTREAM_BUSY_RETRIES and is_upstream_high_demand_error(status, error_msg):
+                                    busy_retry_count += 1
+                                    delay = upstream_busy_retry_delay(busy_retry_count)
+                                    logger.warning("Upstream %s req=%s returned high demand 503; retrying same model in %.1fs (%d/%d)", endpoint, req_id[:8], delay, busy_retry_count, UPSTREAM_BUSY_RETRIES)
+                                    await asyncio.sleep(delay)
                                     continue
                                 logger.warning("Upstream %s req=%s returned %s: %s", endpoint, req_id[:8], status, error_msg[:200])
                                 for event in synthetic_responses_error_events(status, error_msg, f"resp_{req_id.replace('-', '')[:24]}", copilot_model, req_id):
@@ -1875,11 +1924,20 @@ async def responses(request: Request):
 
     try:
         async with httpx.AsyncClient(timeout=120) as client:
-            resp = await client.post(url, headers=copilot_headers, json=forward_body)
+            target_url = url
+            headers = copilot_headers
+            resp = await client.post(target_url, headers=headers, json=forward_body)
             if is_expired_ide_token_error(resp.status_code, resp.text):
                 logger.warning("Upstream %s req=%s returned expired token; refreshing and retrying once", endpoint, req_id[:8])
-                retry_url, retry_headers = refresh_upstream_auth_after_401(req_id, endpoint, resp.text)
-                resp = await client.post(retry_url, headers=retry_headers, json=forward_body)
+                target_url, headers = refresh_upstream_auth_after_401(req_id, endpoint, resp.text)
+                resp = await client.post(target_url, headers=headers, json=forward_body)
+            busy_retry_count = 0
+            while busy_retry_count < UPSTREAM_BUSY_RETRIES and is_upstream_high_demand_error(resp.status_code, resp.text):
+                busy_retry_count += 1
+                delay = upstream_busy_retry_delay(busy_retry_count)
+                logger.warning("Upstream %s req=%s returned high demand 503; retrying same model in %.1fs (%d/%d)", endpoint, req_id[:8], delay, busy_retry_count, UPSTREAM_BUSY_RETRIES)
+                await asyncio.sleep(delay)
+                resp = await client.post(target_url, headers=headers, json=forward_body)
     except Exception as e:
         duration = (time.monotonic() - t_start) * 1000
         audit_log(req_id, body, copilot_model, "/v1/responses", None, 500, duration, str(e))
@@ -1969,7 +2027,8 @@ async def messages(request: Request):
             collected_text = []
             usage = {}
             status = 200
-            retry_count = 0
+            auth_retry_count = 0
+            busy_retry_count = 0
             target_url = url
             headers = copilot_headers
             try:
@@ -1980,10 +2039,16 @@ async def messages(request: Request):
                             if status != 200:
                                 err = await resp.aread()
                                 error_msg = err.decode()
-                                if retry_count == 0 and is_expired_ide_token_error(status, error_msg):
-                                    retry_count += 1
+                                if auth_retry_count == 0 and is_expired_ide_token_error(status, error_msg):
+                                    auth_retry_count += 1
                                     logger.warning("Upstream %s req=%s returned expired token; refreshing and retrying once", endpoint, req_id[:8])
                                     target_url, headers = refresh_upstream_auth_after_401(req_id, endpoint, error_msg)
+                                    continue
+                                if busy_retry_count < UPSTREAM_BUSY_RETRIES and is_upstream_high_demand_error(status, error_msg):
+                                    busy_retry_count += 1
+                                    delay = upstream_busy_retry_delay(busy_retry_count)
+                                    logger.warning("Upstream %s req=%s returned high demand 503; retrying same model in %.1fs (%d/%d)", endpoint, req_id[:8], delay, busy_retry_count, UPSTREAM_BUSY_RETRIES)
+                                    await asyncio.sleep(delay)
                                     continue
                                 logger.warning("Upstream %s req=%s returned %s: %s", endpoint, req_id[:8], status, error_msg[:200])
                                 yield f"event: error\ndata: {json.dumps({'type':'error','error':{'type':'api_error','message':error_msg}})}\n\n"
@@ -2036,11 +2101,20 @@ async def messages(request: Request):
         # ── Non-streaming response ───────────────────────────────────────────
         try:
             async with httpx.AsyncClient(timeout=120) as client:
-                resp = await client.post(url, headers=copilot_headers, json=forward_body)
+                target_url = url
+                headers = copilot_headers
+                resp = await client.post(target_url, headers=headers, json=forward_body)
                 if is_expired_ide_token_error(resp.status_code, resp.text):
                     logger.warning("Upstream %s req=%s returned expired token; refreshing and retrying once", endpoint, req_id[:8])
-                    retry_url, retry_headers = refresh_upstream_auth_after_401(req_id, endpoint, resp.text)
-                    resp = await client.post(retry_url, headers=retry_headers, json=forward_body)
+                    target_url, headers = refresh_upstream_auth_after_401(req_id, endpoint, resp.text)
+                    resp = await client.post(target_url, headers=headers, json=forward_body)
+                busy_retry_count = 0
+                while busy_retry_count < UPSTREAM_BUSY_RETRIES and is_upstream_high_demand_error(resp.status_code, resp.text):
+                    busy_retry_count += 1
+                    delay = upstream_busy_retry_delay(busy_retry_count)
+                    logger.warning("Upstream %s req=%s returned high demand 503; retrying same model in %.1fs (%d/%d)", endpoint, req_id[:8], delay, busy_retry_count, UPSTREAM_BUSY_RETRIES)
+                    await asyncio.sleep(delay)
+                    resp = await client.post(target_url, headers=headers, json=forward_body)
         except Exception as e:
             duration = (time.monotonic() - t_start) * 1000
             audit_log(req_id, body, copilot_model, endpoint, None, 500, duration, str(e))

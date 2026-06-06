@@ -195,3 +195,19 @@ def test_invalidate_api_key_cache_removes_cached_key(cp4cc, monkeypatch, tmp_pat
 
     assert not api_key_file.exists()
     cp4cc.invalidate_api_key_cache("already gone")
+
+
+def test_is_upstream_high_demand_error_matches_copilot_capacity_503(cp4cc):
+    msg = "Sorry, the upstream model provider is currently experiencing high demand. Please try another model."
+
+    assert cp4cc.is_upstream_high_demand_error(503, msg)
+    assert not cp4cc.is_upstream_high_demand_error(503, "Service unavailable")
+    assert not cp4cc.is_upstream_high_demand_error(429, msg)
+
+
+def test_upstream_busy_retry_delay_uses_bounded_exponential_backoff(cp4cc, monkeypatch):
+    monkeypatch.setattr(cp4cc, "UPSTREAM_BUSY_BACKOFF_SECONDS", 3.0)
+
+    assert cp4cc.upstream_busy_retry_delay(1) == 3.0
+    assert cp4cc.upstream_busy_retry_delay(2) == 6.0
+    assert cp4cc.upstream_busy_retry_delay(10) == 30.0
