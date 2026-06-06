@@ -54,6 +54,7 @@ def test_openai_chat_to_responses_extracts_output_text(cp4cc):
         "total_tokens": 4,
     }
 
+
 def test_forward_body_strips_internal_source_before_upstream(cp4cc):
     body = {
         "model": "claude-sonnet-4.6",
@@ -173,3 +174,24 @@ def test_synthetic_responses_error_events_complete_the_stream(cp4cc):
     joined = "".join(events)
     assert "cp4cc upstream error 413" in joined
     assert "failed to parse request" in joined
+
+
+def test_is_expired_ide_token_error_matches_only_upstream_token_expiry(cp4cc):
+    assert cp4cc.is_expired_ide_token_error(
+        401,
+        "IDE token expired: unauthorized: token expired",
+    )
+    assert cp4cc.is_expired_ide_token_error(401, "unauthorized: token expired")
+    assert not cp4cc.is_expired_ide_token_error(401, "unauthorized")
+    assert not cp4cc.is_expired_ide_token_error(413, "IDE token expired: unauthorized: token expired")
+
+
+def test_invalidate_api_key_cache_removes_cached_key(cp4cc, monkeypatch, tmp_path):
+    api_key_file = tmp_path / "api-key.json"
+    api_key_file.write_text('{"token":"old"}')
+    monkeypatch.setattr(cp4cc, "API_KEY_FILE", str(api_key_file))
+
+    cp4cc.invalidate_api_key_cache("test")
+
+    assert not api_key_file.exists()
+    cp4cc.invalidate_api_key_cache("already gone")

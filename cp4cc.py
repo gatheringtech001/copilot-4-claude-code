@@ -1218,6 +1218,30 @@ def get_api_key() -> str:
     return info["token"]
 
 
+def is_expired_ide_token_error(status_code: int, body_text: str | None) -> bool:
+    """Detect Copilot API key expiry reported by the upstream API itself."""
+    if status_code != 401 or not body_text:
+        return False
+    lower = body_text.lower()
+    return "token expired" in lower and ("ide token" in lower or "unauthorized" in lower)
+
+
+def invalidate_api_key_cache(reason: str) -> None:
+    try:
+        os.remove(API_KEY_FILE)
+        logger.warning("Invalidated cached Copilot API key: %s", reason)
+    except FileNotFoundError:
+        logger.warning("Cached Copilot API key already absent: %s", reason)
+    except OSError as exc:
+        logger.warning("Failed to invalidate cached Copilot API key: %s (%s)", reason, exc)
+
+
+def refresh_upstream_auth_after_401(req_id: str, endpoint: str, error_msg: str) -> tuple[str, dict]:
+    invalidate_api_key_cache(f"upstream {endpoint} req={req_id[:8]} returned token expiry: {error_msg[:200]}")
+    api_key = get_api_key()
+    return f"{get_api_base()}{endpoint}", get_copilot_headers(api_key)
+
+
 def get_api_base() -> str:
     try:
         with open(API_KEY_FILE) as f:
@@ -1702,22 +1726,32 @@ async def chat_completions(request: Request):
             error_msg = None
             status = 200
             usage = {}
+            retry_count = 0
+            target_url = url
+            headers = copilot_headers
             try:
-                async with httpx.AsyncClient(timeout=120) as client:
-                    async with client.stream("POST", url, headers=copilot_headers, json=forward_body) as resp:
-                        status = resp.status_code
-                        if status != 200:
-                            err = await resp.aread()
-                            error_msg = err.decode()
-                            logger.warning("Upstream %s returned %s: %s", endpoint, status, error_msg[:200])
-                            yield f"event: error\ndata: {json.dumps({'type':'error','error':{'message':error_msg}})}\n\n"
-                        else:
-                            async for line in resp.aiter_lines():
-                                if line:
-                                    update_usage_from_sse_line(line, usage)
-                                    yield line + "\n"
-                                else:
-                                    yield "\n"
+                while True:
+                    async with httpx.AsyncClient(timeout=120) as client:
+                        async with client.stream("POST", target_url, headers=headers, json=forward_body) as resp:
+                            status = resp.status_code
+                            if status != 200:
+                                err = await resp.aread()
+                                error_msg = err.decode()
+                                if retry_count == 0 and is_expired_ide_token_error(status, error_msg):
+                                    retry_count += 1
+                                    logger.warning("Upstream %s req=%s returned expired token; refreshing and retrying once", endpoint, req_id[:8])
+                                    target_url, headers = refresh_upstream_auth_after_401(req_id, endpoint, error_msg)
+                                    continue
+                                logger.warning("Upstream %s returned %s: %s", endpoint, status, error_msg[:200])
+                                yield f"event: error\ndata: {json.dumps({'type':'error','error':{'message':error_msg}})}\n\n"
+                            else:
+                                async for line in resp.aiter_lines():
+                                    if line:
+                                        update_usage_from_sse_line(line, usage)
+                                        yield line + "\n"
+                                    else:
+                                        yield "\n"
+                            break
             except Exception as e:
                 error_msg = str(e)
                 logger.error("Chat Completions streaming request error req=%s: %s", req_id[:8], e)
@@ -1733,6 +1767,10 @@ async def chat_completions(request: Request):
     try:
         async with httpx.AsyncClient(timeout=120) as client:
             resp = await client.post(url, headers=copilot_headers, json=forward_body)
+            if is_expired_ide_token_error(resp.status_code, resp.text):
+                logger.warning("Upstream %s req=%s returned expired token; refreshing and retrying once", endpoint, req_id[:8])
+                retry_url, retry_headers = refresh_upstream_auth_after_401(req_id, endpoint, resp.text)
+                resp = await client.post(retry_url, headers=retry_headers, json=forward_body)
     except Exception as e:
         duration = (time.monotonic() - t_start) * 1000
         audit_log(req_id, body, copilot_model, "/v1/chat/completions", None, 500, duration, str(e))
@@ -1796,23 +1834,33 @@ async def responses(request: Request):
             error_msg = None
             status = 200
             usage = {}
+            retry_count = 0
+            target_url = url
+            headers = copilot_headers
             try:
-                async with httpx.AsyncClient(timeout=120) as client:
-                    async with client.stream("POST", url, headers=copilot_headers, json=forward_body) as resp:
-                        status = resp.status_code
-                        if status != 200:
-                            err = await resp.aread()
-                            error_msg = err.decode()
-                            logger.warning("Upstream %s req=%s returned %s: %s", endpoint, req_id[:8], status, error_msg[:200])
-                            for event in synthetic_responses_error_events(status, error_msg, f"resp_{req_id.replace('-', '')[:24]}", copilot_model, req_id):
-                                yield event
-                        else:
-                            async for line in resp.aiter_lines():
-                                if line:
-                                    update_usage_from_sse_line(line, usage)
-                                    yield line + "\n"
-                                else:
-                                    yield "\n"
+                while True:
+                    async with httpx.AsyncClient(timeout=120) as client:
+                        async with client.stream("POST", target_url, headers=headers, json=forward_body) as resp:
+                            status = resp.status_code
+                            if status != 200:
+                                err = await resp.aread()
+                                error_msg = err.decode()
+                                if retry_count == 0 and is_expired_ide_token_error(status, error_msg):
+                                    retry_count += 1
+                                    logger.warning("Upstream %s req=%s returned expired token; refreshing and retrying once", endpoint, req_id[:8])
+                                    target_url, headers = refresh_upstream_auth_after_401(req_id, endpoint, error_msg)
+                                    continue
+                                logger.warning("Upstream %s req=%s returned %s: %s", endpoint, req_id[:8], status, error_msg[:200])
+                                for event in synthetic_responses_error_events(status, error_msg, f"resp_{req_id.replace('-', '')[:24]}", copilot_model, req_id):
+                                    yield event
+                            else:
+                                async for line in resp.aiter_lines():
+                                    if line:
+                                        update_usage_from_sse_line(line, usage)
+                                        yield line + "\n"
+                                    else:
+                                        yield "\n"
+                            break
             except Exception as e:
                 error_msg = str(e)
                 logger.error("Responses streaming request error req=%s: %s", req_id[:8], e)
@@ -1828,6 +1876,10 @@ async def responses(request: Request):
     try:
         async with httpx.AsyncClient(timeout=120) as client:
             resp = await client.post(url, headers=copilot_headers, json=forward_body)
+            if is_expired_ide_token_error(resp.status_code, resp.text):
+                logger.warning("Upstream %s req=%s returned expired token; refreshing and retrying once", endpoint, req_id[:8])
+                retry_url, retry_headers = refresh_upstream_auth_after_401(req_id, endpoint, resp.text)
+                resp = await client.post(retry_url, headers=retry_headers, json=forward_body)
     except Exception as e:
         duration = (time.monotonic() - t_start) * 1000
         audit_log(req_id, body, copilot_model, "/v1/responses", None, 500, duration, str(e))
@@ -1917,44 +1969,54 @@ async def messages(request: Request):
             collected_text = []
             usage = {}
             status = 200
+            retry_count = 0
+            target_url = url
+            headers = copilot_headers
             try:
-                async with httpx.AsyncClient(timeout=120) as client:
-                    async with client.stream("POST", url, headers=copilot_headers, json=forward_body) as resp:
-                        status = resp.status_code
-                        if status != 200:
-                            err = await resp.aread()
-                            error_msg = err.decode()
-                            logger.warning("Upstream %s req=%s returned %s: %s", endpoint, req_id[:8], status, error_msg[:200])
-                            yield f"event: error\ndata: {json.dumps({'type':'error','error':{'type':'api_error','message':error_msg}})}\n\n"
-                        elif use_messages_api:
-                            # Claude model: direct SSE passthrough
-                            async for line in resp.aiter_lines():
-                                if line:
-                                    yield line + "\n"
-                                    if line.startswith("data:"):
+                while True:
+                    async with httpx.AsyncClient(timeout=120) as client:
+                        async with client.stream("POST", target_url, headers=headers, json=forward_body) as resp:
+                            status = resp.status_code
+                            if status != 200:
+                                err = await resp.aread()
+                                error_msg = err.decode()
+                                if retry_count == 0 and is_expired_ide_token_error(status, error_msg):
+                                    retry_count += 1
+                                    logger.warning("Upstream %s req=%s returned expired token; refreshing and retrying once", endpoint, req_id[:8])
+                                    target_url, headers = refresh_upstream_auth_after_401(req_id, endpoint, error_msg)
+                                    continue
+                                logger.warning("Upstream %s req=%s returned %s: %s", endpoint, req_id[:8], status, error_msg[:200])
+                                yield f"event: error\ndata: {json.dumps({'type':'error','error':{'type':'api_error','message':error_msg}})}\n\n"
+                            elif use_messages_api:
+                                # Claude model: direct SSE passthrough
+                                async for line in resp.aiter_lines():
+                                    if line:
+                                        yield line + "\n"
+                                        if line.startswith("data:"):
+                                            try:
+                                                d = json.loads(line[5:])
+                                                if d.get("type") == "content_block_delta":
+                                                    collected_text.append(d.get("delta", {}).get("text", ""))
+                                                if d.get("usage"):
+                                                    usage.update(_extract_usage(d))
+                                                if d.get("message", {}).get("usage"):
+                                                    usage.update(_extract_usage(d.get("message", {})))
+                                            except Exception:
+                                                pass
+                                    else:
+                                        yield "\n"
+                            else:
+                                # Non-Claude: OpenAI SSE → Anthropic SSE conversion
+                                msg_id = f"msg_{uuid4().hex[:24]}"
+                                async for chunk in stream_openai_to_anthropic(resp, msg_id, original_model):
+                                    yield chunk
+                                    if '"text_delta"' in chunk:
                                         try:
-                                            d = json.loads(line[5:])
-                                            if d.get("type") == "content_block_delta":
-                                                collected_text.append(d.get("delta", {}).get("text", ""))
-                                            if d.get("usage"):
-                                                usage.update(_extract_usage(d))
-                                            if d.get("message", {}).get("usage"):
-                                                usage.update(_extract_usage(d.get("message", {})))
+                                            d = json.loads(chunk.split("data: ", 1)[1])
+                                            collected_text.append(d.get("delta", {}).get("text", ""))
                                         except Exception:
                                             pass
-                                else:
-                                    yield "\n"
-                        else:
-                            # Non-Claude: OpenAI SSE → Anthropic SSE conversion
-                            msg_id = f"msg_{uuid4().hex[:24]}"
-                            async for chunk in stream_openai_to_anthropic(resp, msg_id, original_model):
-                                yield chunk
-                                if '"text_delta"' in chunk:
-                                    try:
-                                        d = json.loads(chunk.split("data: ", 1)[1])
-                                        collected_text.append(d.get("delta", {}).get("text", ""))
-                                    except Exception:
-                                        pass
+                            break
             except Exception as e:
                 error_msg = str(e)
                 logger.error("Streaming request error req=%s: %s", req_id[:8], e)
@@ -1975,6 +2037,10 @@ async def messages(request: Request):
         try:
             async with httpx.AsyncClient(timeout=120) as client:
                 resp = await client.post(url, headers=copilot_headers, json=forward_body)
+                if is_expired_ide_token_error(resp.status_code, resp.text):
+                    logger.warning("Upstream %s req=%s returned expired token; refreshing and retrying once", endpoint, req_id[:8])
+                    retry_url, retry_headers = refresh_upstream_auth_after_401(req_id, endpoint, resp.text)
+                    resp = await client.post(retry_url, headers=retry_headers, json=forward_body)
         except Exception as e:
             duration = (time.monotonic() - t_start) * 1000
             audit_log(req_id, body, copilot_model, endpoint, None, 500, duration, str(e))
