@@ -54,7 +54,6 @@ def test_openai_chat_to_responses_extracts_output_text(cp4cc):
         "total_tokens": 4,
     }
 
-
 def test_forward_body_strips_internal_source_before_upstream(cp4cc):
     body = {
         "model": "claude-sonnet-4.6",
@@ -127,3 +126,50 @@ def test_normalize_chat_completion_request_maps_model_and_strips_internal_fields
         "stream": False,
     }
     assert body["_source"] == {"client": "test"}
+
+
+def test_sanitize_responses_payload_omits_oversized_data_image(cp4cc):
+    small_image = "data:image/png;base64," + ("A" * 1024)
+    big_image = "data:image/png;base64," + ("A" * (cp4cc.IMAGE_SINGLE_CHAR_LIMIT + 128))
+    body = {
+        "model": "gpt-5.5",
+        "stream": True,
+        "input": [
+            {
+                "type": "function_call_output",
+                "call_id": "call_small",
+                "output": [{"type": "input_image", "image_url": small_image}],
+            },
+            {
+                "type": "function_call_output",
+                "call_id": "call_big",
+                "output": [{"type": "input_image", "image_url": big_image}],
+            },
+        ],
+    }
+
+    sanitized, report = cp4cc.sanitize_responses_payload(body)
+
+    assert report["images"] == 2
+    assert report["kept"] == 1
+    assert report["omitted"] == 1
+    assert sanitized["input"][0]["output"][0]["image_url"] == small_image
+    replacement = sanitized["input"][1]["output"][0]
+    assert replacement["type"] == "input_text"
+    assert "cp4cc image attachment omitted" in replacement["text"]
+    assert "CP4CC_IMAGE_SINGLE_CHAR_LIMIT" in replacement["text"]
+
+
+def test_synthetic_responses_error_events_complete_the_stream(cp4cc):
+    events = cp4cc.synthetic_responses_error_events(
+        413,
+        '{"error":{"message":"failed to parse request"}}',
+        "resp_test",
+        "gpt-5.5",
+        "12345678-1234-1234-1234-123456789abc",
+    )
+
+    assert any("event: response.completed" in event for event in events)
+    joined = "".join(events)
+    assert "cp4cc upstream error 413" in joined
+    assert "failed to parse request" in joined

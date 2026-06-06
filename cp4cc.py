@@ -117,6 +117,570 @@ logging.basicConfig(
 logger = logging.getLogger("copilot-proxy")
 
 # ============================================================
+# Crash diagnostics — capture "silent death" causes
+# ============================================================
+import atexit
+import faulthandler
+import signal
+import sys
+import threading
+
+DIAG_DIR = LOGS_DIR / "diag"
+DIAG_DIR.mkdir(parents=True, exist_ok=True)
+FAULT_LOG = DIAG_DIR / "faulthandler.log"
+HEARTBEAT_LOG = DIAG_DIR / "heartbeat.log"
+LIFECYCLE_LOG = DIAG_DIR / "lifecycle.log"
+
+# Open fault file unbuffered-binary; faulthandler writes via low-level fd write,
+# so traceback survives even when the process is killed mid-flight.
+_fault_fp = open(FAULT_LOG, "ab", buffering=0)
+faulthandler.enable(file=_fault_fp, all_threads=True)
+
+# On Windows also register SIGABRT/SIGFPE/SIGSEGV/SIGILL handlers explicitly
+# (faulthandler.register only exists on Unix; on Windows the global enable()
+# already covers SEH exceptions like access violations.)
+if hasattr(faulthandler, "register"):
+    for _sig_name in ("SIGABRT", "SIGFPE", "SIGSEGV", "SIGILL", "SIGBUS"):
+        _sig = getattr(signal, _sig_name, None)
+        if _sig is not None:
+            try:
+                faulthandler.register(_sig, file=_fault_fp, all_threads=True, chain=False)
+            except (ValueError, OSError):
+                pass
+
+
+def _lifecycle(event: str, **fields) -> None:
+    """Single-line lifecycle event written to both app.log and lifecycle.log."""
+    payload = {"ts": datetime.now(timezone.utc).isoformat(), "pid": os.getpid(), "event": event, **fields}
+    line = json.dumps(payload, default=str, ensure_ascii=False)
+    try:
+        with open(LIFECYCLE_LOG, "a", encoding="utf-8") as f:
+            f.write(line + "\n")
+    except Exception:
+        pass
+    logger.info("LIFECYCLE %s", line)
+
+
+def _signal_handler(signum, frame):
+    try:
+        name = signal.Signals(signum).name
+    except Exception:
+        name = str(signum)
+    _lifecycle("signal_received", signal=name, signum=int(signum))
+    # Dump current stack of all threads to fault log for forensic purposes
+    try:
+        faulthandler.dump_traceback(file=_fault_fp, all_threads=True)
+        _fault_fp.flush()
+    except Exception:
+        pass
+    # Re-raise default behavior so process actually exits (or gets re-killed)
+    if signum in (getattr(signal, "SIGINT", None), getattr(signal, "SIGTERM", None), getattr(signal, "SIGBREAK", None)):
+        sys.exit(128 + int(signum))
+
+
+for _sig_name in ("SIGINT", "SIGTERM", "SIGBREAK", "SIGHUP"):
+    _sig = getattr(signal, _sig_name, None)
+    if _sig is not None:
+        try:
+            signal.signal(_sig, _signal_handler)
+        except (ValueError, OSError):
+            pass
+
+
+def _excepthook(exc_type, exc_value, exc_tb):
+    import traceback as _tb
+    tb_text = "".join(_tb.format_exception(exc_type, exc_value, exc_tb))
+    _lifecycle("uncaught_exception", exc_type=getattr(exc_type, "__name__", str(exc_type)), msg=str(exc_value))
+    logger.error("UNCAUGHT EXCEPTION:\n%s", tb_text)
+
+
+sys.excepthook = _excepthook
+
+
+def _thread_excepthook(args):
+    import traceback as _tb
+    tb_text = "".join(_tb.format_exception(args.exc_type, args.exc_value, args.exc_traceback))
+    _lifecycle("thread_exception", thread=getattr(args.thread, "name", "?"), exc_type=getattr(args.exc_type, "__name__", "?"), msg=str(args.exc_value))
+    logger.error("THREAD EXCEPTION in %s:\n%s", getattr(args.thread, "name", "?"), tb_text)
+
+
+threading.excepthook = _thread_excepthook
+
+
+# In-flight request tracking (populated by middleware below)
+_inflight_lock = threading.Lock()
+_inflight_requests: dict[str, dict] = {}
+
+
+def _get_rss_mb() -> float:
+    """Return current RSS in MB. Best-effort, never raises."""
+    try:
+        import ctypes
+        from ctypes import wintypes
+
+        class PROCESS_MEMORY_COUNTERS(ctypes.Structure):
+            _fields_ = [
+                ("cb", wintypes.DWORD),
+                ("PageFaultCount", wintypes.DWORD),
+                ("PeakWorkingSetSize", ctypes.c_size_t),
+                ("WorkingSetSize", ctypes.c_size_t),
+                ("QuotaPeakPagedPoolUsage", ctypes.c_size_t),
+                ("QuotaPagedPoolUsage", ctypes.c_size_t),
+                ("QuotaPeakNonPagedPoolUsage", ctypes.c_size_t),
+                ("QuotaNonPagedPoolUsage", ctypes.c_size_t),
+                ("PagefileUsage", ctypes.c_size_t),
+                ("PeakPagefileUsage", ctypes.c_size_t),
+            ]
+
+        counters = PROCESS_MEMORY_COUNTERS()
+        counters.cb = ctypes.sizeof(PROCESS_MEMORY_COUNTERS)
+        h = ctypes.windll.kernel32.GetCurrentProcess()
+        if ctypes.windll.psapi.GetProcessMemoryInfo(h, ctypes.byref(counters), counters.cb):
+            return counters.WorkingSetSize / (1024 * 1024)
+    except Exception:
+        pass
+    return -1.0
+
+
+def _heartbeat_loop():
+    """Write heartbeat every 15s. If the process dies, the last heartbeat
+    timestamp + in-flight request list will pinpoint the moment and likely culprit."""
+    while True:
+        try:
+            with _inflight_lock:
+                inflight_snapshot = [
+                    {"id": rid, "path": v["path"], "age_s": round(time.time() - v["start"], 2),
+                     "size": v.get("size", 0)}
+                    for rid, v in _inflight_requests.items()
+                ]
+            payload = {
+                "ts": datetime.now(timezone.utc).isoformat(),
+                "pid": os.getpid(),
+                "rss_mb": round(_get_rss_mb(), 1),
+                "threads": threading.active_count(),
+                "inflight_n": len(inflight_snapshot),
+                "inflight": inflight_snapshot,
+            }
+            with open(HEARTBEAT_LOG, "a", encoding="utf-8") as f:
+                f.write(json.dumps(payload, ensure_ascii=False) + "\n")
+        except Exception as e:
+            try:
+                logger.warning("heartbeat failed: %s", e)
+            except Exception:
+                pass
+        time.sleep(15)
+
+
+_hb_thread = threading.Thread(target=_heartbeat_loop, name="heartbeat", daemon=True)
+_hb_thread.start()
+
+
+@atexit.register
+def _on_exit():
+    _lifecycle("process_exit", inflight_n=len(_inflight_requests))
+    try:
+        _fault_fp.flush()
+        _fault_fp.close()
+    except Exception:
+        pass
+
+
+_lifecycle("process_start", argv=sys.argv, python=sys.version.split()[0], cwd=os.getcwd())
+
+
+
+def _json_size_and_hash(value) -> tuple[int, str]:
+    try:
+        raw = json.dumps(value, ensure_ascii=False, separators=(",", ":"), sort_keys=True).encode("utf-8")
+    except Exception:
+        return -1, ""
+    return len(raw), hashlib.sha256(raw).hexdigest()[:12]
+
+
+def _summarize_payload_shape(body: dict) -> dict:
+    stats = {
+        "messages": 0,
+        "function_calls": 0,
+        "function_call_outputs": 0,
+        "input_text_blocks": 0,
+        "output_text_blocks": 0,
+        "image_blocks": 0,
+        "image_url_fields": 0,
+        "image_url_chars": 0,
+        "image_data_urls": 0,
+        "image_data_url_chars": 0,
+        "max_image_url_chars": 0,
+        "base64_fields": 0,
+        "base64_chars": 0,
+        "text_chars": 0,
+        "max_text_chars": 0,
+        "string_chars": 0,
+        "max_string_chars": 0,
+        "large_strings": [],
+    }
+
+    def add_text(text: str) -> None:
+        stats["text_chars"] += len(text)
+        stats["max_text_chars"] = max(stats["max_text_chars"], len(text))
+
+    def note_string(path: str, key: str, text: str) -> None:
+        length = len(text)
+        stats["string_chars"] += length
+        stats["max_string_chars"] = max(stats["max_string_chars"], length)
+        if length >= 1024:
+            stats["large_strings"].append(
+                {
+                    "path": path,
+                    "key": key,
+                    "chars": length,
+                    "data_url": text.startswith("data:"),
+                }
+            )
+
+    def note_image_url(value) -> None:
+        if isinstance(value, str):
+            stats["image_url_fields"] += 1
+            stats["image_url_chars"] += len(value)
+            stats["max_image_url_chars"] = max(stats["max_image_url_chars"], len(value))
+            if value.startswith("data:"):
+                stats["image_data_urls"] += 1
+                stats["image_data_url_chars"] += len(value)
+        elif isinstance(value, dict):
+            url = value.get("url") or value.get("image_url")
+            if isinstance(url, str):
+                note_image_url(url)
+
+    def visit(value, path: str = "$") -> None:
+        if isinstance(value, dict):
+            typ = value.get("type")
+            if typ == "message":
+                stats["messages"] += 1
+            elif typ == "function_call":
+                stats["function_calls"] += 1
+            elif typ == "function_call_output":
+                stats["function_call_outputs"] += 1
+            elif typ == "input_text":
+                stats["input_text_blocks"] += 1
+            elif typ == "output_text":
+                stats["output_text_blocks"] += 1
+            elif typ in ("input_image", "image"):
+                stats["image_blocks"] += 1
+
+            if "image_url" in value:
+                stats["image_blocks"] += 1
+                note_image_url(value.get("image_url"))
+
+            source = value.get("source")
+            if isinstance(source, dict) and source.get("type") == "base64":
+                data = source.get("data") or source.get("base64") or ""
+                if isinstance(data, str):
+                    stats["base64_fields"] += 1
+                    stats["base64_chars"] += len(data)
+
+            text = value.get("text")
+            if isinstance(text, str):
+                add_text(text)
+
+            for key, child in value.items():
+                child_path = f"{path}.{key}"
+                if isinstance(child, str):
+                    note_string(child_path, str(key), child)
+                visit(child, child_path)
+        elif isinstance(value, list):
+            for index, item in enumerate(value):
+                visit(item, f"{path}[{index}]")
+
+    visit(body)
+    stats["large_strings"] = sorted(
+        stats["large_strings"],
+        key=lambda item: item["chars"],
+        reverse=True,
+    )[:10]
+    return stats
+
+
+def _compact_shape(stats: dict) -> dict:
+    keys = (
+        "messages",
+        "function_calls",
+        "function_call_outputs",
+        "input_text_blocks",
+        "output_text_blocks",
+        "image_blocks",
+        "image_url_fields",
+        "image_url_chars",
+        "image_data_urls",
+        "image_data_url_chars",
+        "text_chars",
+        "max_text_chars",
+        "max_string_chars",
+    )
+    return {key: stats.get(key, 0) for key in keys if stats.get(key, 0)}
+
+
+def _value_hint(value) -> dict:
+    hint = {"kind": type(value).__name__}
+    if isinstance(value, dict):
+        if "type" in value:
+            hint["type"] = value.get("type")
+        if "role" in value:
+            hint["role"] = value.get("role")
+        if isinstance(value.get("content"), list):
+            hint["content_items"] = len(value["content"])
+        if isinstance(value.get("output"), list):
+            hint["output_items"] = len(value["output"])
+    return hint
+
+
+def _summarize_top_key_sizes(body: dict) -> list[dict]:
+    sizes = []
+    for key, value in body.items():
+        size, digest = _json_size_and_hash(value)
+        sizes.append({"key": key, "bytes": size, "hash": digest, **_value_hint(value)})
+    return sorted(sizes, key=lambda item: item["bytes"], reverse=True)
+
+
+def _summarize_input_item_sizes(body: dict, limit: int = 12) -> list[dict]:
+    input_value = body.get("input")
+    if not isinstance(input_value, list):
+        return []
+
+    items = []
+    for index, item in enumerate(input_value):
+        size, digest = _json_size_and_hash(item)
+        item_shape = _compact_shape(_summarize_payload_shape(item))
+        items.append(
+            {
+                "index": index,
+                "bytes": size,
+                "hash": digest,
+                **_value_hint(item),
+                "shape": item_shape,
+            }
+        )
+    return sorted(items, key=lambda item: item["bytes"], reverse=True)[:limit]
+
+
+def log_request_diag(
+    req_id: str,
+    endpoint: str,
+    original_model: str,
+    copilot_model: str,
+    request: Request,
+    body: dict,
+    forward_body: dict,
+) -> None:
+    body_bytes, body_hash = _json_size_and_hash(body)
+    forward_bytes, forward_hash = _json_size_and_hash(forward_body)
+    input_value = body.get("input")
+    input_type = type(input_value).__name__
+    input_items = len(input_value) if isinstance(input_value, list) else None
+    input_chars = len(input_value) if isinstance(input_value, str) else None
+    tools = body.get("tools")
+    include = body.get("include")
+    reasoning = body.get("reasoning")
+    shape = _summarize_payload_shape(body)
+    forward_shape = _summarize_payload_shape(forward_body)
+    diag = {
+        "content_length": request.headers.get("content-length"),
+        "body_bytes": body_bytes,
+        "forward_bytes": forward_bytes,
+        "body_hash": body_hash,
+        "forward_hash": forward_hash,
+        "top_keys": sorted(body.keys()),
+        "stream": body.get("stream", False),
+        "input_type": input_type,
+        "input_items": input_items,
+        "input_chars": input_chars,
+        "tools_count": len(tools) if isinstance(tools, list) else 0,
+        "include_count": len(include) if isinstance(include, list) else 0,
+        "previous_response_id": bool(body.get("previous_response_id")),
+        "truncation": body.get("truncation"),
+        "parallel_tool_calls": body.get("parallel_tool_calls"),
+        "reasoning_keys": sorted(reasoning.keys()) if isinstance(reasoning, dict) else [],
+        "shape": shape,
+        "forward_shape": forward_shape,
+        "top_key_sizes": _summarize_top_key_sizes(body),
+        "forward_top_key_sizes": _summarize_top_key_sizes(forward_body),
+        "input_item_sizes": _summarize_input_item_sizes(body),
+        "forward_input_item_sizes": _summarize_input_item_sizes(forward_body),
+    }
+    logger.info(
+        "request_diag id=%s endpoint=%s model=%s→%s diag=%s",
+        req_id[:8],
+        endpoint,
+        original_model,
+        copilot_model,
+        json.dumps(diag, ensure_ascii=False, separators=(",", ":")),
+    )
+
+
+def _int_env(name: str, default: int) -> int:
+    try:
+        value = int(os.environ.get(name, "").strip())
+        return value if value >= 0 else default
+    except ValueError:
+        return default
+
+
+IMAGE_SINGLE_CHAR_LIMIT = _int_env("CP4CC_IMAGE_SINGLE_CHAR_LIMIT", 1_000_000)
+IMAGE_TOTAL_CHAR_LIMIT = _int_env("CP4CC_IMAGE_TOTAL_CHAR_LIMIT", 1_200_000)
+IMAGE_MAX_FORWARDED = _int_env("CP4CC_IMAGE_MAX_FORWARDED", 4)
+IMAGE_ATTACHMENT_DIR = LOGS_DIR / "image_attachments"
+DATA_IMAGE_RE = re.compile(r"^data:(image/[a-zA-Z0-9.+-]+);base64,(.*)$", re.DOTALL)
+
+
+def _is_data_image_url(value) -> bool:
+    return isinstance(value, str) and DATA_IMAGE_RE.match(value) is not None
+
+
+def _image_meta(data_url: str) -> dict:
+    match = DATA_IMAGE_RE.match(data_url)
+    if not match:
+        return {"mime": "image/unknown", "ext": "img", "chars": len(data_url)}
+    mime, encoded = match.groups()
+    subtype = mime.split("/", 1)[1].split("+", 1)[0].lower()
+    ext = {"jpeg": "jpg", "svg+xml": "svg"}.get(subtype, subtype or "img")
+    return {
+        "mime": mime,
+        "ext": ext,
+        "chars": len(data_url),
+        "base64_chars": len(encoded),
+        "approx_bytes": len(encoded) * 3 // 4,
+        "sha256": hashlib.sha256(data_url.encode("utf-8")).hexdigest()[:16],
+    }
+
+
+def _save_data_image(data_url: str, meta: dict) -> str | None:
+    match = DATA_IMAGE_RE.match(data_url)
+    if not match:
+        return None
+    _, encoded = match.groups()
+    try:
+        IMAGE_ATTACHMENT_DIR.mkdir(parents=True, exist_ok=True)
+        path = IMAGE_ATTACHMENT_DIR / f"{meta['sha256']}.{meta['ext']}"
+        if not path.exists():
+            path.write_bytes(base64.b64decode(encoded, validate=False))
+        return str(path)
+    except Exception as exc:
+        logger.warning("failed to persist omitted image attachment: %s", exc)
+        return None
+
+
+def _path_to_str(path: tuple) -> str:
+    result = "$"
+    for part in path:
+        if isinstance(part, int):
+            result += f"[{part}]"
+        else:
+            result += f".{part}"
+    return result
+
+
+def _collect_data_images(value, path: tuple = ()) -> list[dict]:
+    found = []
+    if isinstance(value, dict):
+        image_url = value.get("image_url")
+        if value.get("type") in ("input_image", "image") and _is_data_image_url(image_url):
+            found.append({"path": path, "path_str": _path_to_str(path), "url": image_url, **_image_meta(image_url)})
+        source = value.get("source")
+        if isinstance(source, dict) and source.get("type") == "base64":
+            data = source.get("data") or source.get("base64")
+            media_type = source.get("media_type") or source.get("mime_type")
+            if isinstance(data, str) and isinstance(media_type, str) and media_type.startswith("image/"):
+                data_url = f"data:{media_type};base64,{data}"
+                found.append({"path": path, "path_str": _path_to_str(path), "url": data_url, **_image_meta(data_url)})
+        for key, child in value.items():
+            found.extend(_collect_data_images(child, path + (key,)))
+    elif isinstance(value, list):
+        for index, child in enumerate(value):
+            found.extend(_collect_data_images(child, path + (index,)))
+    return found
+
+
+def _image_placeholder(ref: dict, reason: str) -> str:
+    saved_path = _save_data_image(ref["url"], ref)
+    saved = f", saved={saved_path}" if saved_path else ""
+    return (
+        "[cp4cc image attachment omitted before GitHub Copilot forwarding: "
+        f"path={ref['path_str']}, mime={ref['mime']}, chars={ref['chars']}, "
+        f"approx_bytes={ref.get('approx_bytes', 0)}, sha256={ref['sha256']}{saved}, "
+        f"reason={reason}. The original image remains available locally; use a smaller "
+        "crop or explicitly inspect the saved file when visual details are required.]"
+    )
+
+
+def sanitize_responses_payload(body: dict) -> tuple[dict, dict]:
+    """Approximate Copilot's attachment layer for Codex image tool output.
+
+    Codex records view_image results as data:image URLs inside the Responses input
+    history. GitHub Copilot's native clients use an attachment/blob path instead of
+    replaying large base64 data URLs in every turn. Keep small recent images, but
+    replace oversized or over-budget images with text placeholders before forwarding.
+    """
+    refs = _collect_data_images(body)
+    if not refs:
+        return body, {"images": 0, "kept": 0, "omitted": 0}
+
+    keep_paths: set[tuple] = set()
+    omit_reasons: dict[tuple, str] = {}
+    total_chars = 0
+    kept = 0
+    for ref in reversed(refs):
+        if ref["chars"] > IMAGE_SINGLE_CHAR_LIMIT:
+            omit_reasons[ref["path"]] = (
+                f"single image exceeds CP4CC_IMAGE_SINGLE_CHAR_LIMIT={IMAGE_SINGLE_CHAR_LIMIT}"
+            )
+        elif kept >= IMAGE_MAX_FORWARDED:
+            omit_reasons[ref["path"]] = f"forwarded image count exceeds CP4CC_IMAGE_MAX_FORWARDED={IMAGE_MAX_FORWARDED}"
+        elif total_chars + ref["chars"] > IMAGE_TOTAL_CHAR_LIMIT:
+            omit_reasons[ref["path"]] = (
+                f"image data budget exceeds CP4CC_IMAGE_TOTAL_CHAR_LIMIT={IMAGE_TOTAL_CHAR_LIMIT}"
+            )
+        else:
+            keep_paths.add(ref["path"])
+            total_chars += ref["chars"]
+            kept += 1
+
+    by_path = {ref["path"]: ref for ref in refs}
+
+    def clone(value, path: tuple = ()):
+        if isinstance(value, dict):
+            image_url = value.get("image_url")
+            if value.get("type") in ("input_image", "image") and _is_data_image_url(image_url):
+                if path in keep_paths:
+                    return dict(value)
+                return {"type": "input_text", "text": _image_placeholder(by_path[path], omit_reasons[path])}
+            source = value.get("source")
+            if (
+                isinstance(source, dict)
+                and source.get("type") == "base64"
+                and isinstance(source.get("media_type") or source.get("mime_type"), str)
+                and (source.get("media_type") or source.get("mime_type")).startswith("image/")
+                and path in by_path
+                and path not in keep_paths
+            ):
+                return {"type": "text", "text": _image_placeholder(by_path[path], omit_reasons[path])}
+            return {key: clone(child, path + (key,)) for key, child in value.items()}
+        if isinstance(value, list):
+            return [clone(child, path + (index,)) for index, child in enumerate(value)]
+        return value
+
+    sanitized = clone(body)
+    omitted = len(refs) - len(keep_paths)
+    omitted_chars = sum(ref["chars"] for ref in refs if ref["path"] not in keep_paths)
+    return sanitized, {
+        "images": len(refs),
+        "kept": len(keep_paths),
+        "omitted": omitted,
+        "kept_chars": total_chars,
+        "omitted_chars": omitted_chars,
+        "single_char_limit": IMAGE_SINGLE_CHAR_LIMIT,
+        "total_char_limit": IMAGE_TOTAL_CHAR_LIMIT,
+        "max_forwarded": IMAGE_MAX_FORWARDED,
+    }
+
+# ============================================================
 # Audit Log System (one JSON file per session)
 # ============================================================
 
@@ -719,10 +1283,18 @@ def map_model_name(model: str) -> str:
     claude-opus-4-6-20250514 → claude-opus-4.6  (strip date suffix)
     claude-haiku-4-5         → claude-haiku-4.5
     gpt-4o                   → gpt-4o (unchanged)
+
+    Override: any claude-opus-* is routed to claude-opus-4.7-1m-internal
+    (matches the model Copilot CLI itself uses).
     """
     original = model
     model = re.sub(r"-\d{8}$", "", model)         # strip YYYYMMDD date suffix
     model = re.sub(r"(\d)-(\d+)$", r"\1.\2", model)  # 4-6 → 4.6
+
+    # Force-route every Claude Opus variant to the 1M-context internal build
+    if model.startswith("claude-opus"):
+        model = "claude-opus-4.7-1m-internal"
+
     if model != original:
         logger.debug("Model name mapped: %s → %s", original, model)
     return model
@@ -916,6 +1488,40 @@ async def stream_openai_to_responses(openai_stream: httpx.Response, response_id:
     yield f"event: response.completed\ndata: {json.dumps(completed)}\n\n"
 
 
+def synthetic_responses_error_events(status_code: int, error_msg: str, response_id: str, model: str, req_id: str) -> list[str]:
+    item_id = f"msg_{uuid4().hex[:24]}"
+    text = (
+        f"cp4cc upstream error {status_code} for request {req_id[:8]}: "
+        f"{error_msg[:800]}"
+    )
+    completed = {
+        "type": "response.completed",
+        "response": {
+            "id": response_id,
+            "model": model,
+            "status": "completed",
+            "output": [
+                {
+                    "id": item_id,
+                    "type": "message",
+                    "status": "completed",
+                    "role": "assistant",
+                    "content": [{"type": "output_text", "text": text}],
+                }
+            ],
+            "output_text": text,
+            "usage": {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0},
+        },
+    }
+    return [
+        f"event: response.created\ndata: {json.dumps({'type':'response.created','response':{'id':response_id,'model':model,'status':'in_progress'}})}\n\n",
+        f"event: response.output_item.added\ndata: {json.dumps({'type':'response.output_item.added','output_index':0,'item':{'id':item_id,'type':'message','status':'in_progress','role':'assistant','content':[]}})}\n\n",
+        f"event: response.output_text.delta\ndata: {json.dumps({'type':'response.output_text.delta','delta':text})}\n\n",
+        f"event: response.output_item.done\ndata: {json.dumps({'type':'response.output_item.done','output_index':0,'item':completed['response']['output'][0]})}\n\n",
+        f"event: response.completed\ndata: {json.dumps(completed)}\n\n",
+    ]
+
+
 def openai_to_anthropic(openai_resp: dict) -> dict:
     """OpenAI /chat/completions response → Anthropic /v1/messages format"""
     choice = openai_resp["choices"][0]
@@ -978,6 +1584,52 @@ async def stream_openai_to_anthropic(
 # ============================================================
 
 app = FastAPI(title="GitHub Copilot → Anthropic API Proxy", docs_url=None, redoc_url=None)
+
+
+@app.middleware("http")
+async def _request_lifecycle(request: Request, call_next):
+    """Track every request in the in-flight table so heartbeat can show what
+    was running when the process died, and to log unexpected mid-request aborts."""
+    rid = uuid4().hex[:8]
+    try:
+        size = int(request.headers.get("content-length", "0") or 0)
+    except ValueError:
+        size = 0
+    info = {"path": request.url.path, "method": request.method, "start": time.time(), "size": size}
+    with _inflight_lock:
+        _inflight_requests[rid] = info
+    try:
+        response = await call_next(request)
+        return response
+    except BaseException as exc:
+        _lifecycle(
+            "request_failed",
+            rid=rid,
+            path=info["path"],
+            method=info["method"],
+            content_length=size,
+            duration_s=round(time.time() - info["start"], 2),
+            exc_type=type(exc).__name__,
+            msg=str(exc)[:300],
+        )
+        raise
+    finally:
+        with _inflight_lock:
+            _inflight_requests.pop(rid, None)
+
+
+@app.on_event("startup")
+async def _install_loop_diagnostics():
+    import asyncio
+    loop = asyncio.get_running_loop()
+
+    def _loop_exc_handler(_loop, context):
+        msg = context.get("exception") or context.get("message")
+        _lifecycle("asyncio_exception", message=str(msg)[:500], keys=list(context.keys()))
+        logger.error("ASYNCIO EXC: %s", context)
+
+    loop.set_exception_handler(_loop_exc_handler)
+    _lifecycle("loop_ready", loop=type(loop).__name__)
 
 
 @app.get("/health")
@@ -1110,7 +1762,8 @@ async def responses(request: Request):
     body["_source"] = source_from_request(request)
     original_model: str = body.get("model", "")
     copilot_model = map_model_name(original_model)
-    forward_body = upstream_body(body, copilot_model)
+    raw_forward_body = upstream_body(body, copilot_model)
+    forward_body, image_sanitize_report = sanitize_responses_payload(raw_forward_body)
 
     try:
         api_key = get_api_key()
@@ -1124,6 +1777,13 @@ async def responses(request: Request):
     endpoint = "/v1/responses"
     is_stream = forward_body.get("stream", False)
     url = f"{api_base}{endpoint}"
+    log_request_diag(req_id, endpoint, original_model, copilot_model, request, body, forward_body)
+    if image_sanitize_report.get("omitted"):
+        logger.info(
+            "responses req=%s image_sanitize=%s",
+            req_id[:8],
+            json.dumps(image_sanitize_report, ensure_ascii=False, separators=(",", ":")),
+        )
 
     logger.debug(
         "responses req=%s model=%s→%s endpoint=%s stream=%s",
@@ -1143,8 +1803,9 @@ async def responses(request: Request):
                         if status != 200:
                             err = await resp.aread()
                             error_msg = err.decode()
-                            logger.warning("Upstream %s returned %s: %s", endpoint, status, error_msg[:200])
-                            yield f"event: error\ndata: {json.dumps({'type':'error','error':{'message':error_msg}})}\n\n"
+                            logger.warning("Upstream %s req=%s returned %s: %s", endpoint, req_id[:8], status, error_msg[:200])
+                            for event in synthetic_responses_error_events(status, error_msg, f"resp_{req_id.replace('-', '')[:24]}", copilot_model, req_id):
+                                yield event
                         else:
                             async for line in resp.aiter_lines():
                                 if line:
@@ -1174,7 +1835,7 @@ async def responses(request: Request):
 
     duration = (time.monotonic() - t_start) * 1000
     if resp.status_code != 200:
-        logger.warning("Upstream %s returned %s: %s", endpoint, resp.status_code, resp.text[:300])
+        logger.warning("Upstream %s req=%s returned %s: %s", endpoint, req_id[:8], resp.status_code, resp.text[:300])
         audit_log(req_id, body, copilot_model, "/v1/responses", resp.text[:500], resp.status_code, duration, f"upstream {resp.status_code}")
         raise HTTPException(status_code=resp.status_code, detail=resp.text)
 
@@ -1240,6 +1901,7 @@ async def messages(request: Request):
         forward_body = anthropic_to_openai(body, copilot_model)
 
     is_stream = forward_body.get("stream", False)
+    log_request_diag(req_id, endpoint, original_model, copilot_model, request, body, forward_body)
     logger.debug(
         "req=%s model=%s→%s endpoint=%s stream=%s",
         req_id[:8], original_model, copilot_model, endpoint, is_stream,
@@ -1262,7 +1924,7 @@ async def messages(request: Request):
                         if status != 200:
                             err = await resp.aread()
                             error_msg = err.decode()
-                            logger.warning("Upstream %s returned %s: %s", endpoint, status, error_msg[:200])
+                            logger.warning("Upstream %s req=%s returned %s: %s", endpoint, req_id[:8], status, error_msg[:200])
                             yield f"event: error\ndata: {json.dumps({'type':'error','error':{'type':'api_error','message':error_msg}})}\n\n"
                         elif use_messages_api:
                             # Claude model: direct SSE passthrough
@@ -1321,7 +1983,7 @@ async def messages(request: Request):
         duration = (time.monotonic() - t_start) * 1000
 
         if resp.status_code != 200:
-            logger.warning("Upstream %s returned %s: %s", endpoint, resp.status_code, resp.text[:300])
+            logger.warning("Upstream %s req=%s returned %s: %s", endpoint, req_id[:8], resp.status_code, resp.text[:300])
             audit_log(req_id, body, copilot_model, endpoint,
                       resp.text[:500], resp.status_code, duration,
                       f"upstream {resp.status_code}")
