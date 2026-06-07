@@ -146,7 +146,7 @@ if hasattr(faulthandler, "register"):
         if _sig is not None:
             try:
                 faulthandler.register(_sig, file=_fault_fp, all_threads=True, chain=False)
-            except (ValueError, OSError):
+            except (ValueError, OSError, RuntimeError):
                 pass
 
 
