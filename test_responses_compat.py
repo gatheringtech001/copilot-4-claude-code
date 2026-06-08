@@ -211,3 +211,92 @@ def test_upstream_busy_retry_delay_uses_bounded_exponential_backoff(cp4cc, monke
     assert cp4cc.upstream_busy_retry_delay(1) == 3.0
     assert cp4cc.upstream_busy_retry_delay(2) == 6.0
     assert cp4cc.upstream_busy_retry_delay(10) == 30.0
+
+
+
+def test_collect_encrypted_content_hashes_recurses(cp4cc):
+    body = {
+        "input": [
+            {"type": "reasoning", "encrypted_content": "cipher-one"},
+            {"nested": {"encrypted_content": "cipher-two"}},
+        ]
+    }
+
+    hashes = cp4cc.collect_encrypted_content_hashes(body)
+
+    assert cp4cc.encrypted_content_hash("cipher-one") in hashes
+    assert cp4cc.encrypted_content_hash("cipher-two") in hashes
+
+
+def test_bound_responses_encrypted_content_reuses_original_api_key(cp4cc, monkeypatch, tmp_path):
+    binding_file = tmp_path / "bindings.json"
+    monkeypatch.setattr(cp4cc, "RESPONSES_BINDINGS_FILE", str(binding_file))
+    old_info = {
+        "token": "old-token",
+        "expires_at": 9999999999,
+        "endpoints": {"api": "https://old.example"},
+        "tracking_id": "old-tracking",
+    }
+    new_info = {
+        "token": "new-token",
+        "expires_at": 9999999999,
+        "endpoints": {"api": "https://new.example"},
+        "tracking_id": "new-tracking",
+    }
+    cipher_hash = cp4cc.encrypted_content_hash("cipher-from-old-account")
+    cp4cc.bind_encrypted_content_hashes({cipher_hash}, old_info)
+    monkeypatch.setattr(cp4cc, "get_api_key_info", lambda: new_info)
+
+    selected = cp4cc.select_api_key_info_for_responses_body({
+        "input": [{"type": "reasoning", "encrypted_content": "cipher-from-old-account"}]
+    })
+
+    assert selected["token"] == "old-token"
+    assert cp4cc.get_api_base(selected) == "https://old.example"
+
+
+def test_expired_encrypted_content_binding_falls_back_to_current_key(cp4cc, monkeypatch, tmp_path):
+    binding_file = tmp_path / "bindings.json"
+    monkeypatch.setattr(cp4cc, "RESPONSES_BINDINGS_FILE", str(binding_file))
+    expired_info = {"token": "expired", "expires_at": 1, "endpoints": {"api": "https://old.example"}}
+    current_info = {"token": "current", "expires_at": 9999999999, "endpoints": {"api": "https://current.example"}}
+    cp4cc.bind_encrypted_content_hashes({cp4cc.encrypted_content_hash("cipher")}, expired_info)
+    monkeypatch.setattr(cp4cc, "get_api_key_info", lambda: current_info)
+
+    selected = cp4cc.select_api_key_info_for_responses_body({
+        "input": [{"type": "reasoning", "encrypted_content": "cipher"}]
+    })
+
+    assert selected["token"] == "current"
+
+
+def test_update_encrypted_hashes_from_sse_line_extracts_nested_response_output(cp4cc):
+    hashes = set()
+    line = 'data: {"type":"response.completed","response":{"output":[{"type":"reasoning","encrypted_content":"cipher-out"}]}}'
+
+    cp4cc.update_encrypted_hashes_from_sse_line(line, hashes)
+
+    assert cp4cc.encrypted_content_hash("cipher-out") in hashes
+
+
+def test_strip_encrypted_content_removes_only_cipher_fields(cp4cc):
+    body = {
+        "input": [
+            {"type": "reasoning", "encrypted_content": "bad-cipher", "summary": [{"text": "keep"}]},
+            {"type": "message", "content": "keep message"},
+        ],
+        "include": ["reasoning.encrypted_content"],
+    }
+
+    stripped = cp4cc.strip_encrypted_content_fields(body)
+
+    assert "encrypted_content" not in str(stripped)
+    assert stripped["input"][0]["summary"] == [{"text": "keep"}]
+    assert stripped["input"][1]["content"] == "keep message"
+
+
+def test_invalid_encrypted_content_error_detection(cp4cc):
+    body = '{"error":{"message":"The encrypted content abc could not be verified. Reason: Encrypted content could not be decrypted or parsed.","code":"invalid_request_body"}}'
+
+    assert cp4cc.is_invalid_encrypted_content_error(400, body)
+    assert not cp4cc.is_invalid_encrypted_content_error(401, body)

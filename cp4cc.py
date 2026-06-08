@@ -89,6 +89,7 @@ ADMIN_PUBLIC_PREFIX = os.environ.get("CP4CC_ADMIN_PUBLIC_PREFIX", "")
 TOKEN_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".github_copilot_token")
 ACCESS_TOKEN_FILE = os.path.join(TOKEN_DIR, "access-token")
 API_KEY_FILE = os.path.join(TOKEN_DIR, "api-key.json")
+RESPONSES_BINDINGS_FILE = os.path.join(TOKEN_DIR, "responses-bindings.json")
 
 # ============================================================
 # Session & Directory Initialization
@@ -1195,14 +1196,14 @@ def get_access_token() -> str:
     return token
 
 
-def get_api_key() -> str:
-    """Get Copilot API key, auto-refresh on expiry"""
+def get_api_key_info() -> dict:
+    """Return the current Copilot API key response, refreshing it when expired."""
     _ensure_token_dir()
     try:
         with open(API_KEY_FILE) as f:
             info = json.load(f)
             if info.get("expires_at", 0) > datetime.now().timestamp():
-                return info["token"]
+                return info
     except (IOError, json.JSONDecodeError, KeyError):
         pass
 
@@ -1226,7 +1227,12 @@ def get_api_key() -> str:
     with open(API_KEY_FILE, "w") as f:
         json.dump(info, f)
     logger.info("Copilot API key refreshed, expires_at=%s", info.get("expires_at"))
-    return info["token"]
+    return info
+
+
+def get_api_key() -> str:
+    """Get Copilot API key, auto-refresh on expiry"""
+    return get_api_key_info()["token"]
 
 
 def is_expired_ide_token_error(status_code: int, body_text: str | None) -> bool:
@@ -1268,7 +1274,9 @@ def refresh_upstream_auth_after_401(req_id: str, endpoint: str, error_msg: str) 
     return f"{get_api_base()}{endpoint}", get_copilot_headers(api_key)
 
 
-def get_api_base() -> str:
+def get_api_base(api_key_info: dict | None = None) -> str:
+    if api_key_info is not None:
+        return api_key_info.get("endpoints", {}).get("api", GITHUB_COPILOT_API_BASE)
     try:
         with open(API_KEY_FILE) as f:
             info = json.load(f)
@@ -1291,6 +1299,126 @@ def get_copilot_headers(api_key: str) -> dict:
         "x-vscode-user-agent-library-version": "electron-fetch",
         "X-Initiator": "user",
     }
+
+
+def api_key_identity(info: dict) -> str:
+    """Stable, non-secret identity for the upstream Copilot account/token response."""
+    for key in ("tracking_id", "tid", "sub"):
+        if info.get(key):
+            return str(info[key])
+    orgs = info.get("organization_list") or info.get("enterprise_list") or []
+    sku = info.get("sku") or "unknown-sku"
+    seed = json.dumps({"orgs": orgs, "sku": sku, "api": info.get("endpoints", {}).get("api")}, sort_keys=True)
+    return hashlib.sha256(seed.encode("utf-8")).hexdigest()[:16]
+
+
+def _safe_api_key_info(info: dict) -> dict:
+    return {
+        "token": info.get("token", ""),
+        "expires_at": info.get("expires_at", 0),
+        "endpoints": info.get("endpoints", {}),
+        "tracking_id": info.get("tracking_id"),
+        "sku": info.get("sku"),
+        "organization_list": info.get("organization_list"),
+        "enterprise_list": info.get("enterprise_list"),
+        "identity": api_key_identity(info),
+    }
+
+
+def encrypted_content_hash(value: str) -> str:
+    return hashlib.sha256(value.encode("utf-8")).hexdigest()
+
+
+def collect_encrypted_content_hashes(value) -> set[str]:
+    hashes: set[str] = set()
+    if isinstance(value, dict):
+        for key, child in value.items():
+            if key == "encrypted_content" and isinstance(child, str) and child:
+                hashes.add(encrypted_content_hash(child))
+            else:
+                hashes.update(collect_encrypted_content_hashes(child))
+    elif isinstance(value, list):
+        for child in value:
+            hashes.update(collect_encrypted_content_hashes(child))
+    return hashes
+
+
+def _read_responses_bindings() -> dict:
+    try:
+        with open(RESPONSES_BINDINGS_FILE) as f:
+            data = json.load(f)
+            return data if isinstance(data, dict) else {}
+    except (IOError, json.JSONDecodeError):
+        return {}
+
+
+def _write_responses_bindings(data: dict) -> None:
+    _ensure_token_dir()
+    tmp = f"{RESPONSES_BINDINGS_FILE}.tmp"
+    with open(tmp, "w") as f:
+        json.dump(data, f)
+    os.replace(tmp, RESPONSES_BINDINGS_FILE)
+
+
+def bind_encrypted_content_hashes(hashes: set[str], api_key_info: dict) -> None:
+    if not hashes:
+        return
+    data = _read_responses_bindings()
+    safe_info = _safe_api_key_info(api_key_info)
+    now = datetime.now(timezone.utc).isoformat()
+    for digest in hashes:
+        data[digest] = {"api_key_info": safe_info, "updated_at": now}
+    _write_responses_bindings(data)
+
+
+def select_api_key_info_for_responses_body(body: dict) -> dict:
+    current = get_api_key_info()
+    hashes = collect_encrypted_content_hashes(body)
+    if not hashes:
+        return current
+    data = _read_responses_bindings()
+    now_ts = datetime.now().timestamp()
+    for digest in hashes:
+        binding = data.get(digest) or {}
+        info = binding.get("api_key_info") or {}
+        token = info.get("token")
+        if token and info.get("expires_at", 0) > now_ts:
+            if api_key_identity(info) != api_key_identity(current):
+                logger.info(
+                    "Responses encrypted_content binding selected upstream identity=%s current_identity=%s",
+                    info.get("identity") or api_key_identity(info),
+                    api_key_identity(current),
+                )
+            return info
+    return current
+
+
+def update_encrypted_hashes_from_sse_line(line: str, hashes: set[str]) -> None:
+    if not line.startswith("data:"):
+        return
+    data = line[5:].strip()
+    if not data or data == "[DONE]":
+        return
+    try:
+        payload = json.loads(data)
+    except Exception:
+        return
+    hashes.update(collect_encrypted_content_hashes(payload))
+
+
+def strip_encrypted_content_fields(value):
+    if isinstance(value, dict):
+        return {key: strip_encrypted_content_fields(child) for key, child in value.items() if key != "encrypted_content"}
+    if isinstance(value, list):
+        return [strip_encrypted_content_fields(child) for child in value if child != "reasoning.encrypted_content"]
+    return value
+
+
+def is_invalid_encrypted_content_error(status_code: int, body_text: str | None) -> bool:
+    if status_code != 400 or not body_text:
+        return False
+    lower = body_text.lower()
+    return "encrypted content" in lower and ("could not be decrypted" in lower or "could not be verified" in lower)
 
 
 # ============================================================
@@ -1846,13 +1974,14 @@ async def responses(request: Request):
     forward_body, image_sanitize_report = sanitize_responses_payload(raw_forward_body)
 
     try:
-        api_key = get_api_key()
+        api_key_info = select_api_key_info_for_responses_body(forward_body)
+        api_key = api_key_info["token"]
     except Exception as e:
         logger.error("Authentication failed req=%s: %s", req_id[:8], e)
         audit_log(req_id, body, copilot_model, "responses-auth", None, 401, 0, str(e))
         raise HTTPException(status_code=401, detail=f"GitHub Copilot authentication failed: {e}")
 
-    api_base = get_api_base()
+    api_base = get_api_base(api_key_info)
     copilot_headers = get_copilot_headers(api_key)
     endpoint = "/v1/responses"
     is_stream = forward_body.get("stream", False)
@@ -1876,14 +2005,17 @@ async def responses(request: Request):
             error_msg = None
             status = 200
             usage = {}
+            response_encrypted_hashes: set[str] = set()
             auth_retry_count = 0
             busy_retry_count = 0
+            encrypted_retry_count = 0
             target_url = url
             headers = copilot_headers
+            request_body = forward_body
             try:
                 while True:
                     async with httpx.AsyncClient(timeout=120) as client:
-                        async with client.stream("POST", target_url, headers=headers, json=forward_body) as resp:
+                        async with client.stream("POST", target_url, headers=headers, json=request_body) as resp:
                             status = resp.status_code
                             if status != 200:
                                 err = await resp.aread()
@@ -1892,6 +2024,11 @@ async def responses(request: Request):
                                     auth_retry_count += 1
                                     logger.warning("Upstream %s req=%s returned expired token; refreshing and retrying once", endpoint, req_id[:8])
                                     target_url, headers = refresh_upstream_auth_after_401(req_id, endpoint, error_msg)
+                                    continue
+                                if encrypted_retry_count == 0 and is_invalid_encrypted_content_error(status, error_msg):
+                                    encrypted_retry_count += 1
+                                    logger.warning("Upstream %s req=%s could not decrypt encrypted_content; retrying once without encrypted_content", endpoint, req_id[:8])
+                                    request_body = strip_encrypted_content_fields(request_body)
                                     continue
                                 if busy_retry_count < UPSTREAM_BUSY_RETRIES and is_upstream_high_demand_error(status, error_msg):
                                     busy_retry_count += 1
@@ -1906,6 +2043,7 @@ async def responses(request: Request):
                                 async for line in resp.aiter_lines():
                                     if line:
                                         update_usage_from_sse_line(line, usage)
+                                        update_encrypted_hashes_from_sse_line(line, response_encrypted_hashes)
                                         yield line + "\n"
                                     else:
                                         yield "\n"
@@ -1913,6 +2051,8 @@ async def responses(request: Request):
             except Exception as e:
                 error_msg = str(e)
                 logger.error("Responses streaming request error req=%s: %s", req_id[:8], e)
+            if status == 200 and response_encrypted_hashes:
+                bind_encrypted_content_hashes(response_encrypted_hashes, api_key_info)
             duration = (time.monotonic() - t_start) * 1000
             audit_log(req_id, body, copilot_model, "/v1/responses", {"stream": True, "usage": usage}, status, duration, error_msg)
 
@@ -1926,18 +2066,23 @@ async def responses(request: Request):
         async with httpx.AsyncClient(timeout=120) as client:
             target_url = url
             headers = copilot_headers
-            resp = await client.post(target_url, headers=headers, json=forward_body)
+            request_body = forward_body
+            resp = await client.post(target_url, headers=headers, json=request_body)
             if is_expired_ide_token_error(resp.status_code, resp.text):
                 logger.warning("Upstream %s req=%s returned expired token; refreshing and retrying once", endpoint, req_id[:8])
                 target_url, headers = refresh_upstream_auth_after_401(req_id, endpoint, resp.text)
-                resp = await client.post(target_url, headers=headers, json=forward_body)
+                resp = await client.post(target_url, headers=headers, json=request_body)
+            if is_invalid_encrypted_content_error(resp.status_code, resp.text):
+                logger.warning("Upstream %s req=%s could not decrypt encrypted_content; retrying once without encrypted_content", endpoint, req_id[:8])
+                request_body = strip_encrypted_content_fields(request_body)
+                resp = await client.post(target_url, headers=headers, json=request_body)
             busy_retry_count = 0
             while busy_retry_count < UPSTREAM_BUSY_RETRIES and is_upstream_high_demand_error(resp.status_code, resp.text):
                 busy_retry_count += 1
                 delay = upstream_busy_retry_delay(busy_retry_count)
                 logger.warning("Upstream %s req=%s returned high demand 503; retrying same model in %.1fs (%d/%d)", endpoint, req_id[:8], delay, busy_retry_count, UPSTREAM_BUSY_RETRIES)
                 await asyncio.sleep(delay)
-                resp = await client.post(target_url, headers=headers, json=forward_body)
+                resp = await client.post(target_url, headers=headers, json=request_body)
     except Exception as e:
         duration = (time.monotonic() - t_start) * 1000
         audit_log(req_id, body, copilot_model, "/v1/responses", None, 500, duration, str(e))
@@ -1950,6 +2095,9 @@ async def responses(request: Request):
         raise HTTPException(status_code=resp.status_code, detail=resp.text)
 
     result = resp.json()
+    response_encrypted_hashes = collect_encrypted_content_hashes(result)
+    if response_encrypted_hashes:
+        bind_encrypted_content_hashes(response_encrypted_hashes, api_key_info)
     audit_log(req_id, body, copilot_model, "/v1/responses", result, 200, duration)
     return JSONResponse(content=result)
 
