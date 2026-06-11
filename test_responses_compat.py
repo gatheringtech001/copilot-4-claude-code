@@ -300,3 +300,24 @@ def test_invalid_encrypted_content_error_detection(cp4cc):
 
     assert cp4cc.is_invalid_encrypted_content_error(400, body)
     assert not cp4cc.is_invalid_encrypted_content_error(401, body)
+
+
+
+def test_sanitize_responses_payload_removes_unsupported_image_generation_tool(cp4cc):
+    body = {
+        "model": "gpt-5.5",
+        "input": "draw a cat",
+        "tools": [
+            {"type": "image_generation", "quality": "high"},
+            {"type": "function", "name": "lookup", "parameters": {"type": "object"}},
+        ],
+        "tool_choice": {"type": "image_generation"},
+    }
+
+    sanitized, report = cp4cc.sanitize_responses_payload(body)
+
+    assert sanitized["tools"] == [{"type": "function", "name": "lookup", "parameters": {"type": "object"}}]
+    assert "tool_choice" not in sanitized
+    assert report["unsupported_tools_removed"] == 1
+    assert report["unsupported_tool_types"] == ["image_generation"]
+    assert body["tools"][0]["type"] == "image_generation"

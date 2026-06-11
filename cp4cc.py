@@ -622,17 +622,54 @@ def _image_placeholder(ref: dict, reason: str) -> str:
     )
 
 
-def sanitize_responses_payload(body: dict) -> tuple[dict, dict]:
-    """Approximate Copilot's attachment layer for Codex image tool output.
+UNSUPPORTED_RESPONSES_TOOL_TYPES = {"image_generation"}
 
-    Codex records view_image results as data:image URLs inside the Responses input
-    history. GitHub Copilot's native clients use an attachment/blob path instead of
-    replaying large base64 data URLs in every turn. Keep small recent images, but
-    replace oversized or over-budget images with text placeholders before forwarding.
+
+def sanitize_responses_tools(body: dict) -> tuple[dict, dict]:
+    """Remove Responses tools that Copilot upstream rejects.
+
+    LiteLLM may include OpenAI-native tools such as image_generation when calling
+    gpt-5.5 via the Responses API. GitHub Copilot currently rejects those tools
+    before generation with unsupported_value, so drop only the unsupported built-ins
+    and preserve normal function tools.
     """
+    tools = body.get("tools")
+    if not isinstance(tools, list):
+        return body, {"unsupported_tools_removed": 0, "unsupported_tool_types": []}
+
+    kept = []
+    removed_types = []
+    for tool in tools:
+        if isinstance(tool, dict) and tool.get("type") in UNSUPPORTED_RESPONSES_TOOL_TYPES:
+            removed_types.append(tool.get("type"))
+            continue
+        kept.append(tool)
+
+    if not removed_types:
+        return body, {"unsupported_tools_removed": 0, "unsupported_tool_types": []}
+
+    sanitized = dict(body)
+    if kept:
+        sanitized["tools"] = kept
+    else:
+        sanitized.pop("tools", None)
+
+    tool_choice = sanitized.get("tool_choice")
+    if isinstance(tool_choice, dict) and tool_choice.get("type") in UNSUPPORTED_RESPONSES_TOOL_TYPES:
+        sanitized.pop("tool_choice", None)
+
+    return sanitized, {
+        "unsupported_tools_removed": len(removed_types),
+        "unsupported_tool_types": sorted(set(removed_types)),
+    }
+
+
+def sanitize_responses_payload(body: dict) -> tuple[dict, dict]:
+    """Approximate Copilot's attachment layer and remove unsupported built-in tools."""
+    body, tool_report = sanitize_responses_tools(body)
     refs = _collect_data_images(body)
     if not refs:
-        return body, {"images": 0, "kept": 0, "omitted": 0}
+        return body, {"images": 0, "kept": 0, "omitted": 0, **tool_report}
 
     keep_paths: set[tuple] = set()
     omit_reasons: dict[tuple, str] = {}
@@ -690,6 +727,7 @@ def sanitize_responses_payload(body: dict) -> tuple[dict, dict]:
         "single_char_limit": IMAGE_SINGLE_CHAR_LIMIT,
         "total_char_limit": IMAGE_TOTAL_CHAR_LIMIT,
         "max_forwarded": IMAGE_MAX_FORWARDED,
+        **tool_report,
     }
 
 # ============================================================
