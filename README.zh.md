@@ -125,10 +125,14 @@ Claude Code 的模型名称会自动转换为 Copilot 格式：
 
 | Claude Code | Copilot |
 |---|---|
-| `claude-opus-4-6` | `claude-opus-4.6` |
-| `claude-opus-4-6-20250514` | `claude-opus-4.6` |
+| `claude-opus-4-8` / `claude-opus-4-8[200k]` / `opus-200k` | 默认 `claude-opus-4.8`，也可用 `CP4CC_DEFAULT_CLAUDE_OPUS_200K_MODEL` 覆盖 |
+| `claude-opus-4-8-20260528` | `claude-opus-4.8` |
+| `claude-opus-4-8[1m]` / `claude-opus-4-8-1m` / `opus-1m` | 默认 `claude-opus-4.8`，也可用 `CP4CC_DEFAULT_CLAUDE_OPUS_1M_MODEL` 覆盖 |
+| `opus` / `claude-opus-latest` | 200k/default 档位 |
 | `claude-haiku-4-5` | `claude-haiku-4.5` |
 | `gpt-4o` | `gpt-4o`（不变） |
+
+当前这个账号的 Copilot 模型元数据里，`claude-opus-4.8` 暴露的是 1M max context window。如果 GitHub 后续放出独立的 200k / 1M 模型 ID，可以直接设置 `CP4CC_DEFAULT_CLAUDE_OPUS_200K_MODEL` 和 `CP4CC_DEFAULT_CLAUDE_OPUS_1M_MODEL`，不需要改代码。
 
 ## 日志与审计
 

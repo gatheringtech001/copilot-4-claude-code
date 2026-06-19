@@ -129,6 +129,37 @@ def test_normalize_chat_completion_request_maps_model_and_strips_internal_fields
     assert body["_source"] == {"client": "test"}
 
 
+def test_map_model_name_normalizes_current_opus_model_ids(cp4cc, monkeypatch):
+    monkeypatch.delenv("CP4CC_DEFAULT_CLAUDE_OPUS_MODEL", raising=False)
+
+    assert cp4cc.map_model_name("claude-opus-4-8") == "claude-opus-4.8"
+    assert cp4cc.map_model_name("claude-opus-4-8-20260528") == "claude-opus-4.8"
+    assert cp4cc.map_model_name("claude-opus-4-8[1m]") == "claude-opus-4.8"
+    assert cp4cc.map_model_name("claude-opus-4.7") == "claude-opus-4.7"
+
+
+def test_map_model_name_routes_opus_alias_to_configured_default(cp4cc, monkeypatch):
+    monkeypatch.setenv("CP4CC_DEFAULT_CLAUDE_OPUS_MODEL", "claude-opus-4-7")
+
+    assert cp4cc.map_model_name("opus") == "claude-opus-4.7"
+    assert cp4cc.map_model_name("claude-opus-latest") == "claude-opus-4.7"
+
+
+def test_map_model_name_keeps_opus_context_tiers_separate(cp4cc, monkeypatch):
+    monkeypatch.setenv("CP4CC_DEFAULT_CLAUDE_OPUS_200K_MODEL", "claude-opus-4-8")
+    monkeypatch.setenv("CP4CC_DEFAULT_CLAUDE_OPUS_1M_MODEL", "claude-opus-4-8-1m-internal")
+
+    assert cp4cc.map_model_name("opus-200k") == "claude-opus-4.8"
+    assert cp4cc.map_model_name("claude-opus-4-8[200k]") == "claude-opus-4.8"
+    assert cp4cc.map_model_name("opus-1m") == "claude-opus-4.8-1m-internal"
+    assert cp4cc.map_model_name("claude-opus-4-8[1m]") == "claude-opus-4.8-1m-internal"
+
+
+def test_unknown_claude_variant_still_uses_messages_api(cp4cc):
+    assert cp4cc.use_messages_api_for_model("claude-opus-4.8-1m-internal", None)
+    assert not cp4cc.use_messages_api_for_model("gpt-5.5-preview", None)
+
+
 def test_sanitize_responses_payload_omits_oversized_data_image(cp4cc):
     small_image = "data:image/png;base64," + ("A" * 1024)
     big_image = "data:image/png;base64," + ("A" * (cp4cc.IMAGE_SINGLE_CHAR_LIMIT + 128))
