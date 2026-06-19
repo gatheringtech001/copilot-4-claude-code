@@ -5,7 +5,7 @@ Exposes GitHub Copilot as a standard Anthropic API, enabling tools like Claude C
 
 Key findings:
   - Claude models support direct passthrough via /v1/messages (no format conversion needed)
-  - Model name format: claude-opus-4-6 → claude-opus-4.6 (hyphen → dot)
+  - Model name format: claude-opus-4-8 → claude-opus-4.8 (hyphen → dot)
   - API base is read from endpoints.api in api-key.json (may be an enterprise domain)
 
 Authentication flow:
@@ -1492,24 +1492,73 @@ def get_model_info(model_id: str) -> dict | None:
     return None
 
 
+def _split_claude_context_tier(model: str) -> tuple[str, str | None]:
+    model = model.strip()
+    tier = None
+    if re.search(r"(\[1m\]|[-_]1m)$", model, flags=re.IGNORECASE):
+        tier = "1m"
+        model = re.sub(r"(\[1m\]|[-_]1m)$", "", model, flags=re.IGNORECASE)
+    elif re.search(r"(\[200k\]|[-_]200k)$", model, flags=re.IGNORECASE):
+        tier = "200k"
+        model = re.sub(r"(\[200k\]|[-_]200k)$", "", model, flags=re.IGNORECASE)
+    return model, tier
+
+
+def _normalize_copilot_claude_model_name(model: str) -> str:
+    model = re.sub(r"-\d{8}$", "", model)            # strip YYYYMMDD date suffix
+    model = re.sub(r"(\d)-(\d+)(?=$|-|\[)", r"\1.\2", model)  # 4-8 → 4.8
+    return model
+
+
+def _default_claude_opus_200k_model() -> str:
+    return _normalize_copilot_claude_model_name(
+        os.getenv(
+            "CP4CC_DEFAULT_CLAUDE_OPUS_200K_MODEL",
+            os.getenv("CP4CC_DEFAULT_CLAUDE_OPUS_MODEL", "claude-opus-4.8"),
+        )
+    )
+
+
+def _default_claude_opus_1m_model() -> str:
+    return _normalize_copilot_claude_model_name(
+        os.getenv(
+            "CP4CC_DEFAULT_CLAUDE_OPUS_1M_MODEL",
+            os.getenv("CP4CC_DEFAULT_CLAUDE_OPUS_MODEL", "claude-opus-4.8"),
+        )
+    )
+
+
+def use_messages_api_for_model(copilot_model: str, model_info: dict | None) -> bool:
+    if model_info:
+        return "/v1/messages" in (model_info.get("supported_endpoints", []) or [])
+    # Hidden/preview Claude variants may not show up in /models but still speak Anthropic.
+    return copilot_model.startswith("claude-")
+
+
 def map_model_name(model: str) -> str:
     """
     Convert Claude Code model name to GitHub Copilot model name format
-    claude-opus-4-6          → claude-opus-4.6
-    claude-opus-4-6-20250514 → claude-opus-4.6  (strip date suffix)
+    claude-opus-4-8          → claude-opus-4.8  (200k/default tier)
+    claude-opus-4-8-20260528 → claude-opus-4.8  (strip date suffix)
+    claude-opus-4-8[1m]      → CP4CC_DEFAULT_CLAUDE_OPUS_1M_MODEL or claude-opus-4.8
+    opus-1m                  → CP4CC_DEFAULT_CLAUDE_OPUS_1M_MODEL or claude-opus-4.8
+    opus-200k                → CP4CC_DEFAULT_CLAUDE_OPUS_200K_MODEL or claude-opus-4.8
     claude-haiku-4-5         → claude-haiku-4.5
     gpt-4o                   → gpt-4o (unchanged)
-
-    Override: any claude-opus-* is routed to claude-opus-4.7-1m-internal
-    (matches the model Copilot CLI itself uses).
     """
     original = model
-    model = re.sub(r"-\d{8}$", "", model)         # strip YYYYMMDD date suffix
-    model = re.sub(r"(\d)-(\d+)$", r"\1.\2", model)  # 4-6 → 4.6
+    model, context_tier = _split_claude_context_tier(model)
+    model = _normalize_copilot_claude_model_name(model)
 
-    # Force-route every Claude Opus variant to the 1M-context internal build
-    if model.startswith("claude-opus"):
-        model = "claude-opus-4.7-1m-internal"
+    if model in {"opus", "claude-opus", "claude-opus-latest"}:
+        if context_tier == "1m":
+            model = _default_claude_opus_1m_model()
+        else:
+            model = _default_claude_opus_200k_model()
+    elif model.startswith("claude-opus") and context_tier == "1m":
+        model = _default_claude_opus_1m_model()
+    elif model.startswith("claude-opus") and context_tier == "200k":
+        model = _default_claude_opus_200k_model()
 
     if model != original:
         logger.debug("Model name mapped: %s → %s", original, model)
@@ -2179,8 +2228,7 @@ async def messages(request: Request):
 
     # Determine which endpoint to use
     model_info = get_model_info(copilot_model)
-    supported = model_info.get("supported_endpoints", []) if model_info else []
-    use_messages_api = "/v1/messages" in supported
+    use_messages_api = use_messages_api_for_model(copilot_model, model_info)
 
     if use_messages_api:
         # ── Claude models: direct passthrough /v1/messages ──────────────────

@@ -123,10 +123,14 @@ Claude Code model names are automatically mapped to Copilot format:
 
 | Claude Code | Copilot |
 |---|---|
-| `claude-opus-4-6` | `claude-opus-4.6` |
-| `claude-opus-4-6-20250514` | `claude-opus-4.6` |
+| `claude-opus-4-8` / `claude-opus-4-8[200k]` / `opus-200k` | `claude-opus-4.8` by default, or `CP4CC_DEFAULT_CLAUDE_OPUS_200K_MODEL` |
+| `claude-opus-4-8-20260528` | `claude-opus-4.8` |
+| `claude-opus-4-8[1m]` / `claude-opus-4-8-1m` / `opus-1m` | `claude-opus-4.8` by default, or `CP4CC_DEFAULT_CLAUDE_OPUS_1M_MODEL` |
+| `opus` / `claude-opus-latest` | 200k/default tier |
 | `claude-haiku-4-5` | `claude-haiku-4.5` |
 | `gpt-4o` | `gpt-4o` (unchanged) |
+
+Current Copilot model metadata for this account exposes `claude-opus-4.8` with a 1M max context window. If GitHub later exposes separate 200k/1M model IDs, set `CP4CC_DEFAULT_CLAUDE_OPUS_200K_MODEL` and `CP4CC_DEFAULT_CLAUDE_OPUS_1M_MODEL` without changing code.
 
 ## Logging & Audit
 
