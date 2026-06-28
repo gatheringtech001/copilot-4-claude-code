@@ -1291,6 +1291,12 @@ def is_upstream_high_demand_error(status_code: int, body_text: str | None) -> bo
     )
 
 
+def is_retryable_upstream_error(status_code: int, body_text: str | None) -> bool:
+    if status_code == 502:
+        return True
+    return is_upstream_high_demand_error(status_code, body_text)
+
+
 def upstream_busy_retry_delay(retry_number: int) -> float:
     retry_number = max(1, retry_number)
     return min(30.0, UPSTREAM_BUSY_BACKOFF_SECONDS * (2 ** (retry_number - 1)))
@@ -1984,10 +1990,10 @@ async def chat_completions(request: Request):
                                     logger.warning("Upstream %s req=%s returned expired token; refreshing and retrying once", endpoint, req_id[:8])
                                     target_url, headers = refresh_upstream_auth_after_401(req_id, endpoint, error_msg)
                                     continue
-                                if busy_retry_count < UPSTREAM_BUSY_RETRIES and is_upstream_high_demand_error(status, error_msg):
+                                if busy_retry_count < UPSTREAM_BUSY_RETRIES and is_retryable_upstream_error(status, error_msg):
                                     busy_retry_count += 1
                                     delay = upstream_busy_retry_delay(busy_retry_count)
-                                    logger.warning("Upstream %s req=%s returned high demand 503; retrying same model in %.1fs (%d/%d)", endpoint, req_id[:8], delay, busy_retry_count, UPSTREAM_BUSY_RETRIES)
+                                    logger.warning("Upstream %s req=%s returned retryable %s; retrying same model in %.1fs (%d/%d)", endpoint, req_id[:8], status, delay, busy_retry_count, UPSTREAM_BUSY_RETRIES)
                                     await asyncio.sleep(delay)
                                     continue
                                 logger.warning("Upstream %s returned %s: %s", endpoint, status, error_msg[:200])
@@ -2022,10 +2028,10 @@ async def chat_completions(request: Request):
                 target_url, headers = refresh_upstream_auth_after_401(req_id, endpoint, resp.text)
                 resp = await client.post(target_url, headers=headers, json=forward_body)
             busy_retry_count = 0
-            while busy_retry_count < UPSTREAM_BUSY_RETRIES and is_upstream_high_demand_error(resp.status_code, resp.text):
+            while busy_retry_count < UPSTREAM_BUSY_RETRIES and is_retryable_upstream_error(resp.status_code, resp.text):
                 busy_retry_count += 1
                 delay = upstream_busy_retry_delay(busy_retry_count)
-                logger.warning("Upstream %s req=%s returned high demand 503; retrying same model in %.1fs (%d/%d)", endpoint, req_id[:8], delay, busy_retry_count, UPSTREAM_BUSY_RETRIES)
+                logger.warning("Upstream %s req=%s returned retryable %s; retrying same model in %.1fs (%d/%d)", endpoint, req_id[:8], resp.status_code, delay, busy_retry_count, UPSTREAM_BUSY_RETRIES)
                 await asyncio.sleep(delay)
                 resp = await client.post(target_url, headers=headers, json=forward_body)
     except Exception as e:
@@ -2117,10 +2123,10 @@ async def responses(request: Request):
                                     logger.warning("Upstream %s req=%s could not decrypt encrypted_content; retrying once without encrypted_content", endpoint, req_id[:8])
                                     request_body = strip_encrypted_content_fields(request_body)
                                     continue
-                                if busy_retry_count < UPSTREAM_BUSY_RETRIES and is_upstream_high_demand_error(status, error_msg):
+                                if busy_retry_count < UPSTREAM_BUSY_RETRIES and is_retryable_upstream_error(status, error_msg):
                                     busy_retry_count += 1
                                     delay = upstream_busy_retry_delay(busy_retry_count)
-                                    logger.warning("Upstream %s req=%s returned high demand 503; retrying same model in %.1fs (%d/%d)", endpoint, req_id[:8], delay, busy_retry_count, UPSTREAM_BUSY_RETRIES)
+                                    logger.warning("Upstream %s req=%s returned retryable %s; retrying same model in %.1fs (%d/%d)", endpoint, req_id[:8], status, delay, busy_retry_count, UPSTREAM_BUSY_RETRIES)
                                     await asyncio.sleep(delay)
                                     continue
                                 logger.warning("Upstream %s req=%s returned %s: %s", endpoint, req_id[:8], status, error_msg[:200])
@@ -2164,10 +2170,10 @@ async def responses(request: Request):
                 request_body = strip_encrypted_content_fields(request_body)
                 resp = await client.post(target_url, headers=headers, json=request_body)
             busy_retry_count = 0
-            while busy_retry_count < UPSTREAM_BUSY_RETRIES and is_upstream_high_demand_error(resp.status_code, resp.text):
+            while busy_retry_count < UPSTREAM_BUSY_RETRIES and is_retryable_upstream_error(resp.status_code, resp.text):
                 busy_retry_count += 1
                 delay = upstream_busy_retry_delay(busy_retry_count)
-                logger.warning("Upstream %s req=%s returned high demand 503; retrying same model in %.1fs (%d/%d)", endpoint, req_id[:8], delay, busy_retry_count, UPSTREAM_BUSY_RETRIES)
+                logger.warning("Upstream %s req=%s returned retryable %s; retrying same model in %.1fs (%d/%d)", endpoint, req_id[:8], resp.status_code, delay, busy_retry_count, UPSTREAM_BUSY_RETRIES)
                 await asyncio.sleep(delay)
                 resp = await client.post(target_url, headers=headers, json=request_body)
     except Exception as e:
@@ -2278,10 +2284,10 @@ async def messages(request: Request):
                                     logger.warning("Upstream %s req=%s returned expired token; refreshing and retrying once", endpoint, req_id[:8])
                                     target_url, headers = refresh_upstream_auth_after_401(req_id, endpoint, error_msg)
                                     continue
-                                if busy_retry_count < UPSTREAM_BUSY_RETRIES and is_upstream_high_demand_error(status, error_msg):
+                                if busy_retry_count < UPSTREAM_BUSY_RETRIES and is_retryable_upstream_error(status, error_msg):
                                     busy_retry_count += 1
                                     delay = upstream_busy_retry_delay(busy_retry_count)
-                                    logger.warning("Upstream %s req=%s returned high demand 503; retrying same model in %.1fs (%d/%d)", endpoint, req_id[:8], delay, busy_retry_count, UPSTREAM_BUSY_RETRIES)
+                                    logger.warning("Upstream %s req=%s returned retryable %s; retrying same model in %.1fs (%d/%d)", endpoint, req_id[:8], status, delay, busy_retry_count, UPSTREAM_BUSY_RETRIES)
                                     await asyncio.sleep(delay)
                                     continue
                                 logger.warning("Upstream %s req=%s returned %s: %s", endpoint, req_id[:8], status, error_msg[:200])
@@ -2343,10 +2349,10 @@ async def messages(request: Request):
                     target_url, headers = refresh_upstream_auth_after_401(req_id, endpoint, resp.text)
                     resp = await client.post(target_url, headers=headers, json=forward_body)
                 busy_retry_count = 0
-                while busy_retry_count < UPSTREAM_BUSY_RETRIES and is_upstream_high_demand_error(resp.status_code, resp.text):
+                while busy_retry_count < UPSTREAM_BUSY_RETRIES and is_retryable_upstream_error(resp.status_code, resp.text):
                     busy_retry_count += 1
                     delay = upstream_busy_retry_delay(busy_retry_count)
-                    logger.warning("Upstream %s req=%s returned high demand 503; retrying same model in %.1fs (%d/%d)", endpoint, req_id[:8], delay, busy_retry_count, UPSTREAM_BUSY_RETRIES)
+                    logger.warning("Upstream %s req=%s returned retryable %s; retrying same model in %.1fs (%d/%d)", endpoint, req_id[:8], resp.status_code, delay, busy_retry_count, UPSTREAM_BUSY_RETRIES)
                     await asyncio.sleep(delay)
                     resp = await client.post(target_url, headers=headers, json=forward_body)
         except Exception as e:
