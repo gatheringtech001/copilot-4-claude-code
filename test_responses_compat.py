@@ -365,14 +365,28 @@ def test_sanitize_responses_payload_removes_unsupported_image_generation_tool(cp
 
 
 def test_sanitize_responses_payload_normalizes_function_tool_schema_root(cp4cc):
+    view_schema = {
+        "type": "object",
+        "properties": {"mode": {"type": "string", "const": "view"}},
+        "required": ["mode"],
+        "additionalProperties": False,
+    }
+    create_schema = {
+        "type": "object",
+        "properties": {"mode": {"type": "string", "const": "create"}},
+        "required": ["mode"],
+        "additionalProperties": False,
+    }
+    update_schema = {
+        "type": "object",
+        "properties": {"mode": {"type": "string", "const": "update"}},
+        "required": ["mode"],
+        "additionalProperties": False,
+    }
     automation_schema = {
         "oneOf": [
-            {
-                "type": "object",
-                "properties": {"mode": {"type": "string", "const": "view"}},
-                "required": ["mode"],
-                "additionalProperties": False,
-            }
+            view_schema,
+            {"oneOf": [create_schema, update_schema]},
         ],
         "$defs": {"id": {"type": "string", "minLength": 1}},
     }

@@ -627,22 +627,23 @@ SCHEMA_COMPOSITION_KEYS = ("oneOf", "anyOf", "allOf")
 
 
 def _schema_branch_is_object(branch) -> bool:
-    return (
-        isinstance(branch, dict)
-        and (branch.get("type") == "object" or isinstance(branch.get("properties"), dict))
-    )
+    if not isinstance(branch, dict):
+        return False
+    if branch.get("type") == "object" or isinstance(branch.get("properties"), dict):
+        return True
+    if branch.get("type") is not None:
+        return False
+    for key in SCHEMA_COMPOSITION_KEYS:
+        branches = branch.get(key)
+        if isinstance(branches, list) and branches and all(_schema_branch_is_object(child) for child in branches):
+            return True
+    return False
 
 
 def _schema_needs_object_root(schema) -> bool:
     if not isinstance(schema, dict) or schema.get("type") is not None:
         return False
-    if isinstance(schema.get("properties"), dict):
-        return True
-    for key in SCHEMA_COMPOSITION_KEYS:
-        branches = schema.get(key)
-        if isinstance(branches, list) and branches and all(_schema_branch_is_object(branch) for branch in branches):
-            return True
-    return False
+    return _schema_branch_is_object(schema)
 
 
 def _normalize_function_tool_schema(tool: dict) -> tuple[dict, int]:
@@ -651,7 +652,7 @@ def _normalize_function_tool_schema(tool: dict) -> tuple[dict, int]:
 
     schema = normalized.get("parameters")
     if _schema_needs_object_root(schema):
-        normalized["parameters"] = {"type": "object", **schema}
+        normalized["parameters"] = {**schema, "type": "object"}
         changed += 1
 
     function = normalized.get("function")
@@ -659,7 +660,7 @@ def _normalize_function_tool_schema(tool: dict) -> tuple[dict, int]:
         function_schema = function.get("parameters")
         if _schema_needs_object_root(function_schema):
             normalized_function = dict(function)
-            normalized_function["parameters"] = {"type": "object", **function_schema}
+            normalized_function["parameters"] = {**function_schema, "type": "object"}
             normalized["function"] = normalized_function
             changed += 1
 
