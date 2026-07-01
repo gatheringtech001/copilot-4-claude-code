@@ -623,6 +623,47 @@ def _image_placeholder(ref: dict, reason: str) -> str:
 
 
 UNSUPPORTED_RESPONSES_TOOL_TYPES = {"image_generation"}
+SCHEMA_COMPOSITION_KEYS = ("oneOf", "anyOf", "allOf")
+
+
+def _schema_branch_is_object(branch) -> bool:
+    return (
+        isinstance(branch, dict)
+        and (branch.get("type") == "object" or isinstance(branch.get("properties"), dict))
+    )
+
+
+def _schema_needs_object_root(schema) -> bool:
+    if not isinstance(schema, dict) or schema.get("type") is not None:
+        return False
+    if isinstance(schema.get("properties"), dict):
+        return True
+    for key in SCHEMA_COMPOSITION_KEYS:
+        branches = schema.get(key)
+        if isinstance(branches, list) and branches and all(_schema_branch_is_object(branch) for branch in branches):
+            return True
+    return False
+
+
+def _normalize_function_tool_schema(tool: dict) -> tuple[dict, int]:
+    normalized = dict(tool)
+    changed = 0
+
+    schema = normalized.get("parameters")
+    if _schema_needs_object_root(schema):
+        normalized["parameters"] = {"type": "object", **schema}
+        changed += 1
+
+    function = normalized.get("function")
+    if isinstance(function, dict):
+        function_schema = function.get("parameters")
+        if _schema_needs_object_root(function_schema):
+            normalized_function = dict(function)
+            normalized_function["parameters"] = {"type": "object", **function_schema}
+            normalized["function"] = normalized_function
+            changed += 1
+
+    return normalized, changed
 
 
 def sanitize_responses_tools(body: dict) -> tuple[dict, dict]:
@@ -639,14 +680,22 @@ def sanitize_responses_tools(body: dict) -> tuple[dict, dict]:
 
     kept = []
     removed_types = []
+    normalized_schemas = 0
     for tool in tools:
         if isinstance(tool, dict) and tool.get("type") in UNSUPPORTED_RESPONSES_TOOL_TYPES:
             removed_types.append(tool.get("type"))
             continue
+        if isinstance(tool, dict) and tool.get("type") == "function":
+            tool, changed = _normalize_function_tool_schema(tool)
+            normalized_schemas += changed
         kept.append(tool)
 
-    if not removed_types:
-        return body, {"unsupported_tools_removed": 0, "unsupported_tool_types": []}
+    if not removed_types and normalized_schemas == 0:
+        return body, {
+            "unsupported_tools_removed": 0,
+            "unsupported_tool_types": [],
+            "tool_schemas_normalized": 0,
+        }
 
     sanitized = dict(body)
     if kept:
@@ -661,6 +710,7 @@ def sanitize_responses_tools(body: dict) -> tuple[dict, dict]:
     return sanitized, {
         "unsupported_tools_removed": len(removed_types),
         "unsupported_tool_types": sorted(set(removed_types)),
+        "tool_schemas_normalized": normalized_schemas,
     }
 
 

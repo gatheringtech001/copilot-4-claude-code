@@ -362,3 +362,37 @@ def test_sanitize_responses_payload_removes_unsupported_image_generation_tool(cp
     assert report["unsupported_tools_removed"] == 1
     assert report["unsupported_tool_types"] == ["image_generation"]
     assert body["tools"][0]["type"] == "image_generation"
+
+
+def test_sanitize_responses_payload_normalizes_function_tool_schema_root(cp4cc):
+    automation_schema = {
+        "oneOf": [
+            {
+                "type": "object",
+                "properties": {"mode": {"type": "string", "const": "view"}},
+                "required": ["mode"],
+                "additionalProperties": False,
+            }
+        ],
+        "$defs": {"id": {"type": "string", "minLength": 1}},
+    }
+    body = {
+        "model": "gpt-5.5",
+        "input": "check automations",
+        "tools": [
+            {
+                "type": "function",
+                "name": "automation_update",
+                "parameters": automation_schema,
+            }
+        ],
+    }
+
+    sanitized, report = cp4cc.sanitize_responses_payload(body)
+
+    params = sanitized["tools"][0]["parameters"]
+    assert params["type"] == "object"
+    assert params["oneOf"] == automation_schema["oneOf"]
+    assert params["$defs"] == automation_schema["$defs"]
+    assert report["tool_schemas_normalized"] == 1
+    assert "type" not in body["tools"][0]["parameters"]
