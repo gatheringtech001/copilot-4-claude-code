@@ -626,12 +626,16 @@ UNSUPPORTED_RESPONSES_TOOL_TYPES = {"image_generation"}
 SCHEMA_COMPOSITION_KEYS = ("oneOf", "anyOf", "allOf")
 
 
+def _schema_type_is_absent(schema_type) -> bool:
+    return schema_type is None or schema_type == "None"
+
+
 def _schema_branch_is_object(branch) -> bool:
     if not isinstance(branch, dict):
         return False
     if branch.get("type") == "object" or isinstance(branch.get("properties"), dict):
         return True
-    if branch.get("type") is not None:
+    if not _schema_type_is_absent(branch.get("type")):
         return False
     for key in SCHEMA_COMPOSITION_KEYS:
         branches = branch.get(key)
@@ -641,7 +645,7 @@ def _schema_branch_is_object(branch) -> bool:
 
 
 def _schema_needs_object_root(schema) -> bool:
-    if not isinstance(schema, dict) or schema.get("type") is not None:
+    if not isinstance(schema, dict) or not _schema_type_is_absent(schema.get("type")):
         return False
     return _schema_branch_is_object(schema)
 

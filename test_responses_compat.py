@@ -410,3 +410,43 @@ def test_sanitize_responses_payload_normalizes_function_tool_schema_root(cp4cc):
     assert params["$defs"] == automation_schema["$defs"]
     assert report["tool_schemas_normalized"] == 1
     assert "type" not in body["tools"][0]["parameters"]
+
+
+def test_sanitize_responses_payload_normalizes_string_none_function_tool_schema_root(cp4cc):
+    view_schema = {
+        "type": "object",
+        "properties": {"mode": {"type": "string", "const": "view"}},
+        "required": ["mode"],
+        "additionalProperties": False,
+    }
+    update_schema = {
+        "type": "object",
+        "properties": {"mode": {"type": "string", "const": "update"}},
+        "required": ["mode"],
+        "additionalProperties": False,
+    }
+    automation_schema = {
+        "type": "None",
+        "oneOf": [view_schema, update_schema],
+        "$defs": {"id": {"type": "string", "minLength": 1}},
+    }
+    body = {
+        "model": "gpt-5.5",
+        "input": "check automations",
+        "tools": [
+            {
+                "type": "function",
+                "name": "automation_update",
+                "parameters": automation_schema,
+            }
+        ],
+    }
+
+    sanitized, report = cp4cc.sanitize_responses_payload(body)
+
+    params = sanitized["tools"][0]["parameters"]
+    assert params["type"] == "object"
+    assert params["oneOf"] == automation_schema["oneOf"]
+    assert params["$defs"] == automation_schema["$defs"]
+    assert report["tool_schemas_normalized"] == 1
+    assert body["tools"][0]["parameters"]["type"] == "None"
