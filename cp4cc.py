@@ -1575,7 +1575,7 @@ def _default_claude_opus_200k_model() -> str:
     return _normalize_copilot_claude_model_name(
         os.getenv(
             "CP4CC_DEFAULT_CLAUDE_OPUS_200K_MODEL",
-            os.getenv("CP4CC_DEFAULT_CLAUDE_OPUS_MODEL", "claude-opus-4.8"),
+            os.getenv("CP4CC_DEFAULT_CLAUDE_OPUS_MODEL", "claude-opus-5"),
         )
     )
 
@@ -1584,7 +1584,7 @@ def _default_claude_opus_1m_model() -> str:
     return _normalize_copilot_claude_model_name(
         os.getenv(
             "CP4CC_DEFAULT_CLAUDE_OPUS_1M_MODEL",
-            os.getenv("CP4CC_DEFAULT_CLAUDE_OPUS_MODEL", "claude-opus-4.8"),
+            os.getenv("CP4CC_DEFAULT_CLAUDE_OPUS_MODEL", "claude-opus-5"),
         )
     )
 
@@ -1601,9 +1601,9 @@ def map_model_name(model: str) -> str:
     Convert Claude Code model name to GitHub Copilot model name format
     claude-opus-4-8          → claude-opus-4.8  (200k/default tier)
     claude-opus-4-8-20260528 → claude-opus-4.8  (strip date suffix)
-    claude-opus-4-8[1m]      → CP4CC_DEFAULT_CLAUDE_OPUS_1M_MODEL or claude-opus-4.8
-    opus-1m                  → CP4CC_DEFAULT_CLAUDE_OPUS_1M_MODEL or claude-opus-4.8
-    opus-200k                → CP4CC_DEFAULT_CLAUDE_OPUS_200K_MODEL or claude-opus-4.8
+    claude-opus-4-8[1m]      → CP4CC_DEFAULT_CLAUDE_OPUS_1M_MODEL or claude-opus-5
+    opus-1m                  → CP4CC_DEFAULT_CLAUDE_OPUS_1M_MODEL or claude-opus-5
+    opus-200k                → CP4CC_DEFAULT_CLAUDE_OPUS_200K_MODEL or claude-opus-5
     claude-haiku-4-5         → claude-haiku-4.5
     gpt-4o                   → gpt-4o (unchanged)
     """

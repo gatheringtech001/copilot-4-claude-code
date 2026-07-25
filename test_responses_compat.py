@@ -134,8 +134,16 @@ def test_map_model_name_normalizes_current_opus_model_ids(cp4cc, monkeypatch):
 
     assert cp4cc.map_model_name("claude-opus-4-8") == "claude-opus-4.8"
     assert cp4cc.map_model_name("claude-opus-4-8-20260528") == "claude-opus-4.8"
-    assert cp4cc.map_model_name("claude-opus-4-8[1m]") == "claude-opus-4.8"
+    # Env not set → 1m/200k tier fall through to CP4CC_DEFAULT_CLAUDE_OPUS_MODEL default (claude-opus-5)
+    assert cp4cc.map_model_name("claude-opus-4-8[1m]") == "claude-opus-5"
     assert cp4cc.map_model_name("claude-opus-4.7") == "claude-opus-4.7"
+    # New opus-5 / sonnet-5 stay as-is (no hyphen-dot rewrite; no date suffix)
+    assert cp4cc.map_model_name("claude-opus-5") == "claude-opus-5"
+    assert cp4cc.map_model_name("claude-sonnet-5") == "claude-sonnet-5"
+    assert cp4cc.map_model_name("claude-opus-5-20260528") == "claude-opus-5"
+    # opus alias with no override → defaults to claude-opus-5
+    assert cp4cc.map_model_name("opus") == "claude-opus-5"
+    assert cp4cc.map_model_name("claude-opus-latest") == "claude-opus-5"
 
 
 def test_map_model_name_routes_opus_alias_to_configured_default(cp4cc, monkeypatch):
