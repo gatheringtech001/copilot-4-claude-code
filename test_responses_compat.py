@@ -244,14 +244,19 @@ def test_is_upstream_high_demand_error_matches_copilot_capacity_503(cp4cc):
     assert not cp4cc.is_upstream_high_demand_error(429, msg)
 
 
-def test_is_retryable_upstream_error_matches_github_gateway_502(cp4cc):
+def test_is_retryable_upstream_error_matches_transient_upstream_failures(cp4cc):
     body = """<!DOCTYPE html>
 <html>
   <head><title>Unicorn! &middot; GitHub</title></head>
 </html>"""
 
+    assert cp4cc.is_retryable_upstream_error(
+        408,
+        '{"error":{"message":"Timed out reading request body.","code":"user_request_timeout"}}',
+    )
+    assert cp4cc.is_retryable_upstream_error(499, "")
     assert cp4cc.is_retryable_upstream_error(502, body)
-    assert not cp4cc.is_retryable_upstream_error(500, "Internal Server Error")
+    assert cp4cc.is_retryable_upstream_error(500, "Internal Server Error")
 
 
 def test_upstream_busy_retry_delay_uses_bounded_exponential_backoff(cp4cc, monkeypatch):

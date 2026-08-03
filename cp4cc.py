@@ -1347,7 +1347,7 @@ def is_upstream_high_demand_error(status_code: int, body_text: str | None) -> bo
 
 
 def is_retryable_upstream_error(status_code: int, body_text: str | None) -> bool:
-    if status_code == 502:
+    if status_code in (408, 499, 500, 502):
         return True
     return is_upstream_high_demand_error(status_code, body_text)
 
@@ -2188,6 +2188,7 @@ async def responses(request: Request):
                                 for event in synthetic_responses_error_events(status, error_msg, f"resp_{req_id.replace('-', '')[:24]}", copilot_model, req_id):
                                     yield event
                             else:
+                                error_msg = None
                                 async for line in resp.aiter_lines():
                                     if line:
                                         update_usage_from_sse_line(line, usage)
