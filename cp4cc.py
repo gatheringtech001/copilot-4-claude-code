@@ -1983,6 +1983,9 @@ async def list_models():
 def upstream_body(body: dict, mapped_model: str) -> dict:
     """Copy request body for upstream while removing proxy-internal metadata."""
     result = {k: v for k, v in body.items() if not str(k).startswith("_")}
+    if mapped_model == "gpt-5.6-sol" and result.get("service_tier") in {"fast", "priority"}:
+        mapped_model = "gpt-5.6-sol-fast"
+        result.pop("service_tier")
     result["model"] = mapped_model
     return result
 

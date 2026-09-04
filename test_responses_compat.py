@@ -82,6 +82,31 @@ def test_forward_body_keeps_original_body_source_for_audit(cp4cc):
     assert "_source" not in result
 
 
+@pytest.mark.parametrize("service_tier", ["fast", "priority"])
+def test_forward_body_maps_codex_fast_tier_to_copilot_fast_model(cp4cc, service_tier):
+    body = {
+        "model": "gpt-5.6-sol",
+        "input": "hi",
+        "service_tier": service_tier,
+    }
+
+    result = cp4cc.upstream_body(body, "gpt-5.6-sol")
+
+    assert result["model"] == "gpt-5.6-sol-fast"
+    assert "service_tier" not in result
+    assert body["model"] == "gpt-5.6-sol"
+    assert body["service_tier"] == service_tier
+
+
+def test_forward_body_keeps_non_fast_service_tier_for_upstream_validation(cp4cc):
+    body = {"model": "gpt-5.6-sol", "input": "hi", "service_tier": "default"}
+
+    result = cp4cc.upstream_body(body, "gpt-5.6-sol")
+
+    assert result["model"] == "gpt-5.6-sol"
+    assert result["service_tier"] == "default"
+
+
 def test_update_usage_from_sse_line_extracts_responses_usage(cp4cc):
     usage = {}
     line = 'data: {"type":"response.completed","response":{"usage":{"input_tokens":12,"output_tokens":3,"total_tokens":15}}}'
