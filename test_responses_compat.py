@@ -2,6 +2,7 @@ import importlib
 import sys
 
 import pytest
+from fastapi.testclient import TestClient
 
 
 @pytest.fixture()
@@ -275,13 +276,64 @@ def test_is_retryable_upstream_error_matches_transient_upstream_failures(cp4cc):
   <head><title>Unicorn! &middot; GitHub</title></head>
 </html>"""
 
-    assert cp4cc.is_retryable_upstream_error(
+    assert not cp4cc.is_retryable_upstream_error(
         408,
         '{"error":{"message":"Timed out reading request body.","code":"user_request_timeout"}}',
     )
+    assert cp4cc.is_retryable_upstream_error(408, '{"error":{"code":"other_timeout"}}')
+    assert cp4cc.is_retryable_upstream_error(408, "Request Timeout")
     assert cp4cc.is_retryable_upstream_error(499, "")
     assert cp4cc.is_retryable_upstream_error(502, body)
     assert cp4cc.is_retryable_upstream_error(500, "Internal Server Error")
+
+
+@pytest.mark.parametrize("stream", [False, True])
+def test_responses_does_not_resend_body_after_upstream_read_timeout(cp4cc, monkeypatch, stream):
+    error = '{"error":{"code":"user_request_timeout","message":"Timed out reading request body."}}'
+    calls = []
+
+    class FakeResponse:
+        status_code = 408
+        text = error
+
+        async def aread(self):
+            return error.encode()
+
+    class FakeStream:
+        async def __aenter__(self):
+            calls.append("stream")
+            return FakeResponse()
+
+        async def __aexit__(self, *_):
+            pass
+
+    class FakeClient:
+        def __init__(self, **_):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_):
+            pass
+
+        def stream(self, *_args, **_kwargs):
+            return FakeStream()
+
+        async def post(self, *_args, **_kwargs):
+            calls.append("post")
+            return FakeResponse()
+
+    monkeypatch.setattr(cp4cc, "select_api_key_info_for_responses_body", lambda _: {"token": "test"})
+    monkeypatch.setattr(cp4cc, "get_api_base", lambda _: "https://example.invalid")
+    monkeypatch.setattr(cp4cc, "httpx", type("FakeHttpx", (), {"AsyncClient": FakeClient}))
+    monkeypatch.setattr(cp4cc, "audit_log", lambda *_args, **_kwargs: None)
+
+    with TestClient(cp4cc.app) as client:
+        response = client.post("/v1/responses", json={"model": "gpt-6-sol", "input": "hello", "stream": stream})
+
+    assert calls == ["stream" if stream else "post"]
+    assert "user_request_timeout" in response.text
 
 
 def test_upstream_busy_retry_delay_uses_bounded_exponential_backoff(cp4cc, monkeypatch):

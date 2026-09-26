@@ -1347,6 +1347,15 @@ def is_upstream_high_demand_error(status_code: int, body_text: str | None) -> bo
 
 
 def is_retryable_upstream_error(status_code: int, body_text: str | None) -> bool:
+    # Re-sending an identical request cannot fix an upstream timeout while
+    # reading that request's body. Let the client compact/reduce it instead.
+    if status_code == 408 and body_text:
+        try:
+            error = json.loads(body_text).get("error", {})
+            if isinstance(error, dict) and error.get("code") == "user_request_timeout":
+                return False
+        except (ValueError, AttributeError):
+            pass
     if status_code in (408, 499, 500, 502):
         return True
     return is_upstream_high_demand_error(status_code, body_text)
