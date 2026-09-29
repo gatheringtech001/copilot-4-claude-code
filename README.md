@@ -149,6 +149,7 @@ Each audit entry captures: original model, mapped Copilot model, endpoint, strea
 │   ├── app.log          # Application log
 │   └── audit/           # Per-session audit JSON files
 └── .github_copilot_token/
-    ├── access-token     # GitHub OAuth access token
-    └── api-key.json     # Copilot API key (auto-refreshed)
+    ├── access-token                # GitHub OAuth access token
+    ├── api-key.json                # Copilot API key (auto-refreshed)
+    └── responses-bindings.sqlite3  # Expiring Responses identity bindings
 ```

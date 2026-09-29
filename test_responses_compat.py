@@ -1,4 +1,6 @@
 import importlib
+import json
+import sqlite3
 import sys
 
 import pytest
@@ -399,6 +401,44 @@ def test_expired_encrypted_content_binding_falls_back_to_current_key(cp4cc, monk
     })
 
     assert selected["token"] == "current"
+
+
+def test_legacy_json_bindings_migrate_only_active_entries(cp4cc, monkeypatch, tmp_path):
+    binding_file = tmp_path / "bindings.json"
+    monkeypatch.setattr(cp4cc, "RESPONSES_BINDINGS_FILE", str(binding_file))
+    active_info = {
+        "token": "active",
+        "expires_at": 9999999999,
+        "endpoints": {"api": "https://active.example"},
+    }
+    expired_info = {
+        "token": "expired",
+        "expires_at": 1,
+        "endpoints": {"api": "https://expired.example"},
+    }
+    active_hash = cp4cc.encrypted_content_hash("active-cipher")
+    expired_hash = cp4cc.encrypted_content_hash("expired-cipher")
+    binding_file.write_text(json.dumps({
+        active_hash: {"api_key_info": active_info, "updated_at": "2026-01-01T00:00:00+00:00"},
+        expired_hash: {"api_key_info": expired_info, "updated_at": "2026-01-01T00:00:00+00:00"},
+    }))
+    current_info = {
+        "token": "current",
+        "expires_at": 9999999999,
+        "endpoints": {"api": "https://current.example"},
+    }
+    monkeypatch.setattr(cp4cc, "get_api_key_info", lambda: current_info)
+
+    selected = cp4cc.select_api_key_info_for_responses_body({
+        "input": [{"type": "reasoning", "encrypted_content": "active-cipher"}]
+    })
+
+    assert selected["token"] == "active"
+    with sqlite3.connect(cp4cc._responses_bindings_db_file()) as conn:
+        rows = conn.execute(
+            "SELECT digest FROM responses_bindings ORDER BY digest"
+        ).fetchall()
+    assert rows == [(active_hash,)]
 
 
 def test_update_encrypted_hashes_from_sse_line_extracts_nested_response_output(cp4cc):

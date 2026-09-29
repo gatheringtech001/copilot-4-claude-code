@@ -23,6 +23,7 @@ import json
 import logging
 import os
 import re
+import sqlite3
 import time
 from collections import Counter
 from datetime import datetime, timezone
@@ -1451,32 +1452,156 @@ def collect_encrypted_content_hashes(value) -> set[str]:
     return hashes
 
 
-def _read_responses_bindings() -> dict:
+_RESPONSES_BINDINGS_DB_LOCK = threading.Lock()
+_RESPONSES_BINDINGS_INITIALIZED: set[str] = set()
+
+
+def _responses_bindings_db_file() -> str:
+    return str(Path(RESPONSES_BINDINGS_FILE).with_suffix(".sqlite3"))
+
+
+def _initialize_responses_bindings_db() -> str:
+    db_file = _responses_bindings_db_file()
+    if db_file in _RESPONSES_BINDINGS_INITIALIZED:
+        return db_file
+
+    with _RESPONSES_BINDINGS_DB_LOCK:
+        if db_file in _RESPONSES_BINDINGS_INITIALIZED:
+            return db_file
+
+        _ensure_token_dir()
+        with sqlite3.connect(db_file, timeout=30) as conn:
+            conn.execute("PRAGMA journal_mode=WAL")
+            conn.execute("PRAGMA synchronous=NORMAL")
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS responses_bindings (
+                    digest TEXT PRIMARY KEY,
+                    api_key_info TEXT NOT NULL,
+                    expires_at REAL NOT NULL,
+                    updated_at TEXT NOT NULL
+                )
+                """
+            )
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS responses_bindings_expires_at "
+                "ON responses_bindings(expires_at)"
+            )
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS responses_bindings_meta (
+                    key TEXT PRIMARY KEY,
+                    value TEXT NOT NULL
+                )
+                """
+            )
+            migrated = conn.execute(
+                "SELECT value FROM responses_bindings_meta WHERE key = 'legacy_json_migrated'"
+            ).fetchone()
+            if not migrated:
+                migrated_count = _migrate_legacy_responses_bindings(conn)
+                conn.execute(
+                    """
+                    INSERT INTO responses_bindings_meta(key, value)
+                    VALUES ('legacy_json_migrated', '1')
+                    ON CONFLICT(key) DO UPDATE SET value = excluded.value
+                    """
+                )
+                if migrated_count:
+                    logger.info(
+                        "Migrated %d active Responses bindings from JSON to SQLite",
+                        migrated_count,
+                    )
+            conn.execute(
+                "DELETE FROM responses_bindings WHERE expires_at <= ?",
+                (time.time(),),
+            )
+
+        _RESPONSES_BINDINGS_INITIALIZED.add(db_file)
+    return db_file
+
+
+def _migrate_legacy_responses_bindings(conn: sqlite3.Connection) -> int:
     try:
-        with open(RESPONSES_BINDINGS_FILE) as f:
-            data = json.load(f)
-            return data if isinstance(data, dict) else {}
+        with open(RESPONSES_BINDINGS_FILE, encoding="utf-8") as f:
+            legacy = json.load(f)
     except (IOError, json.JSONDecodeError):
-        return {}
+        return 0
+    if not isinstance(legacy, dict):
+        return 0
 
+    now_ts = time.time()
+    rows = []
+    for digest, binding in legacy.items():
+        if not isinstance(digest, str) or not isinstance(binding, dict):
+            continue
+        info = binding.get("api_key_info")
+        if not isinstance(info, dict):
+            continue
+        try:
+            expires_at = float(info.get("expires_at", 0))
+        except (TypeError, ValueError):
+            continue
+        if not info.get("token") or expires_at <= now_ts:
+            continue
+        rows.append(
+            (
+                digest,
+                json.dumps(info, ensure_ascii=False, separators=(",", ":")),
+                expires_at,
+                str(binding.get("updated_at") or datetime.now(timezone.utc).isoformat()),
+            )
+        )
 
-def _write_responses_bindings(data: dict) -> None:
-    _ensure_token_dir()
-    tmp = f"{RESPONSES_BINDINGS_FILE}.tmp"
-    with open(tmp, "w") as f:
-        json.dump(data, f)
-    os.replace(tmp, RESPONSES_BINDINGS_FILE)
+    conn.executemany(
+        """
+        INSERT INTO responses_bindings(digest, api_key_info, expires_at, updated_at)
+        VALUES (?, ?, ?, ?)
+        ON CONFLICT(digest) DO UPDATE SET
+            api_key_info = excluded.api_key_info,
+            expires_at = excluded.expires_at,
+            updated_at = excluded.updated_at
+        """,
+        rows,
+    )
+    return len(rows)
 
 
 def bind_encrypted_content_hashes(hashes: set[str], api_key_info: dict) -> None:
     if not hashes:
         return
-    data = _read_responses_bindings()
     safe_info = _safe_api_key_info(api_key_info)
+    try:
+        expires_at = float(safe_info.get("expires_at", 0))
+    except (TypeError, ValueError):
+        return
+    now_ts = time.time()
+    if not safe_info.get("token") or expires_at <= now_ts:
+        return
+
     now = datetime.now(timezone.utc).isoformat()
-    for digest in hashes:
-        data[digest] = {"api_key_info": safe_info, "updated_at": now}
-    _write_responses_bindings(data)
+    serialized_info = json.dumps(safe_info, ensure_ascii=False, separators=(",", ":"))
+    rows = [
+        (digest, serialized_info, expires_at, now)
+        for digest in hashes
+    ]
+    db_file = _initialize_responses_bindings_db()
+    with sqlite3.connect(db_file, timeout=30) as conn:
+        conn.execute(
+            "DELETE FROM responses_bindings WHERE expires_at <= ?",
+            (now_ts,),
+        )
+        conn.executemany(
+            """
+            INSERT INTO responses_bindings(digest, api_key_info, expires_at, updated_at)
+            VALUES (?, ?, ?, ?)
+            ON CONFLICT(digest) DO UPDATE SET
+                api_key_info = excluded.api_key_info,
+                expires_at = excluded.expires_at,
+                updated_at = excluded.updated_at
+            """,
+            rows,
+        )
 
 
 def select_api_key_info_for_responses_body(body: dict) -> dict:
@@ -1484,13 +1609,31 @@ def select_api_key_info_for_responses_body(body: dict) -> dict:
     hashes = collect_encrypted_content_hashes(body)
     if not hashes:
         return current
-    data = _read_responses_bindings()
-    now_ts = datetime.now().timestamp()
-    for digest in hashes:
-        binding = data.get(digest) or {}
-        info = binding.get("api_key_info") or {}
-        token = info.get("token")
-        if token and info.get("expires_at", 0) > now_ts:
+
+    db_file = _initialize_responses_bindings_db()
+    digest_list = list(hashes)
+    now_ts = time.time()
+    with sqlite3.connect(db_file, timeout=30) as conn:
+        for offset in range(0, len(digest_list), 500):
+            chunk = digest_list[offset:offset + 500]
+            placeholders = ",".join("?" for _ in chunk)
+            row = conn.execute(
+                f"""
+                SELECT api_key_info
+                FROM responses_bindings
+                WHERE digest IN ({placeholders}) AND expires_at > ?
+                LIMIT 1
+                """,
+                (*chunk, now_ts),
+            ).fetchone()
+            if not row:
+                continue
+            try:
+                info = json.loads(row[0])
+            except (TypeError, json.JSONDecodeError):
+                continue
+            if not isinstance(info, dict) or not info.get("token"):
+                continue
             if api_key_identity(info) != api_key_identity(current):
                 logger.info(
                     "Responses encrypted_content binding selected upstream identity=%s current_identity=%s",

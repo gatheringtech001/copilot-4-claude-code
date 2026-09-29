@@ -151,6 +151,7 @@ Claude Code 的模型名称会自动转换为 Copilot 格式：
 │   ├── app.log          # 应用日志
 │   └── audit/           # 每次会话的审计 JSON 文件
 └── .github_copilot_token/
-    ├── access-token     # GitHub OAuth access token
-    └── api-key.json     # Copilot API key（自动刷新）
+    ├── access-token                # GitHub OAuth access token
+    ├── api-key.json                # Copilot API key（自动刷新）
+    └── responses-bindings.sqlite3  # 自动过期的 Responses 身份绑定
 ```
