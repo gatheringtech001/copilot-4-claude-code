@@ -1,5 +1,7 @@
 import importlib
+import json
 import sys
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone, timedelta
 
 import pytest
@@ -32,6 +34,24 @@ def make_req(ts, model="gpt-5.5", endpoint="/v1/responses", status=200, duration
     if source:
         req["source"] = source
     return req
+
+
+def test_concurrent_audit_writes_keep_valid_atomic_snapshot(cp4cc, monkeypatch):
+    monkeypatch.setattr(cp4cc.ARGS, "fast", False)
+
+    def record(i):
+        cp4cc.audit_log(
+            f"request-{i}", {"model": "gpt-6-sol", "stream": True},
+            "gpt-6-sol", "/v1/responses", {"stream": True, "usage": {}}, 200, 10,
+        )
+
+    with ThreadPoolExecutor(max_workers=8) as pool:
+        list(pool.map(record, range(40)))
+    data = json.loads(cp4cc.AUDIT_FILE.read_text())
+    assert len(data["requests"]) == 40
+    assert {entry["id"] for entry in data["requests"]} == {f"request-{i}" for i in range(40)}
+    assert not cp4cc.AUDIT_FILE.with_suffix(".json.tmp").exists()
+    assert len(cp4cc.load_all_audit_requests()) == 40
 
 
 def test_usage_stats_summarizes_requests_by_window_model_endpoint_status_and_tokens(cp4cc):

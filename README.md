@@ -139,6 +139,42 @@ Current Copilot model metadata for this account exposes `claude-opus-4.8` with a
 
 Each audit entry captures: original model, mapped Copilot model, endpoint, stream flag, per-message breakdown (role / type / full body), status code, duration, and response body (up to 2000 chars for streamed responses).
 
+### Responses streaming reliability
+
+`/v1/responses` has a **300-second total processing budget**, including preparation,
+authentication and upstream retries. The first SSE event must arrive within
+120 seconds of starting the upstream stream; subsequent network reads retain a
+120-second idle timeout. Connection and upload timeouts are 10 and 60 seconds.
+These limits apply per proxy request, not to a complete Codex turn: a client may
+still choose to retry failed requests.
+
+Normal SSE frames are forwarded without rewriting. A terminal event closes the
+upstream connection immediately. Truncated/malformed streams, transport errors
+and deadline expiry produce `response.failed`, never a fabricated successful
+assistant response. Requests are not replayed by the proxy after output begins.
+Non-streaming Responses requests share the total budget and retry policy.
+
+Streaming HTTP headers may already be `200`; use the terminal SSE event and
+audit outcome to determine success. Audit records distinguish completed, failed,
+incomplete and cancelled streams (`499` for cancellation before a terminal
+event), and include upstream HTTP status, attempt count, first/last event timing
+and terminal event type. Cancellation after receiving a completed event preserves
+the completed outcome. The heartbeat tracks requests through the full response,
+not only until headers are sent. `X-Request-ID` links a response to its audit/log
+records.
+
+Responses authentication, binding storage, payload preparation and audit writes
+run outside the event loop. SQLite connections are explicitly closed; refreshed
+credentials are used for newly generated encrypted-content bindings. Audit JSON
+snapshots retain their existing format and are serialized under a lock, then
+atomically replaced.
+
+Compact request-start logs are enabled by default. Set
+`CP4CC_REQUEST_DIAGNOSTICS=1` before starting the service to restore detailed
+payload size/hash diagnostics; these are expensive on long, image-heavy inputs.
+Legacy `responses-bindings.json` is migrated once, retaining only unexpired
+bindings. The old JSON is kept unchanged as a backup.
+
 ## Project Structure
 
 ```

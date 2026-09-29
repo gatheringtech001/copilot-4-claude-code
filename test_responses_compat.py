@@ -3,12 +3,14 @@ import json
 import sqlite3
 import sys
 
+import httpx
 import pytest
 from fastapi.testclient import TestClient
 
 
 @pytest.fixture()
-def cp4cc(monkeypatch):
+def cp4cc(monkeypatch, tmp_path):
+    monkeypatch.chdir(tmp_path)
     monkeypatch.setattr(sys, "argv", ["cp4cc.py", "--fast"])
     if "cp4cc" in sys.modules:
         del sys.modules["cp4cc"]
@@ -228,7 +230,7 @@ def test_sanitize_responses_payload_omits_oversized_data_image(cp4cc):
     assert "CP4CC_IMAGE_SINGLE_CHAR_LIMIT" in replacement["text"]
 
 
-def test_synthetic_responses_error_events_complete_the_stream(cp4cc):
+def test_synthetic_responses_error_events_fail_the_stream(cp4cc):
     events = cp4cc.synthetic_responses_error_events(
         413,
         '{"error":{"message":"failed to parse request"}}',
@@ -237,9 +239,10 @@ def test_synthetic_responses_error_events_complete_the_stream(cp4cc):
         "12345678-1234-1234-1234-123456789abc",
     )
 
-    assert any("event: response.completed" in event for event in events)
+    assert any("event: response.failed" in event for event in events)
     joined = "".join(events)
-    assert "cp4cc upstream error 413" in joined
+    assert "response.completed" not in joined
+    assert "cp4cc error 413" in joined
     assert "failed to parse request" in joined
 
 
@@ -294,47 +297,20 @@ def test_responses_does_not_resend_body_after_upstream_read_timeout(cp4cc, monke
     error = '{"error":{"code":"user_request_timeout","message":"Timed out reading request body."}}'
     calls = []
 
-    class FakeResponse:
-        status_code = 408
-        text = error
-
-        async def aread(self):
-            return error.encode()
-
-    class FakeStream:
-        async def __aenter__(self):
-            calls.append("stream")
-            return FakeResponse()
-
-        async def __aexit__(self, *_):
-            pass
-
-    class FakeClient:
-        def __init__(self, **_):
-            pass
-
-        async def __aenter__(self):
-            return self
-
-        async def __aexit__(self, *_):
-            pass
-
-        def stream(self, *_args, **_kwargs):
-            return FakeStream()
-
-        async def post(self, *_args, **_kwargs):
-            calls.append("post")
-            return FakeResponse()
+    async def upstream(request):
+        calls.append(request)
+        return httpx.Response(408, text=error)
 
     monkeypatch.setattr(cp4cc, "select_api_key_info_for_responses_body", lambda _: {"token": "test"})
     monkeypatch.setattr(cp4cc, "get_api_base", lambda _: "https://example.invalid")
-    monkeypatch.setattr(cp4cc, "httpx", type("FakeHttpx", (), {"AsyncClient": FakeClient}))
+    real_client = httpx.AsyncClient
+    monkeypatch.setattr(cp4cc.httpx, "AsyncClient", lambda **kw: real_client(transport=httpx.MockTransport(upstream), **kw))
     monkeypatch.setattr(cp4cc, "audit_log", lambda *_args, **_kwargs: None)
 
     with TestClient(cp4cc.app) as client:
         response = client.post("/v1/responses", json={"model": "gpt-6-sol", "input": "hello", "stream": stream})
 
-    assert calls == ["stream" if stream else "post"]
+    assert len(calls) == 1
     assert "user_request_timeout" in response.text
 
 

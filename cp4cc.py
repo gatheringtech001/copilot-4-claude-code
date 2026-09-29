@@ -26,15 +26,21 @@ import re
 import sqlite3
 import time
 from collections import Counter
+from contextlib import asynccontextmanager, closing
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import AsyncIterator
+from typing import AsyncGenerator, AsyncIterator, Awaitable, TypeVar
 from uuid import uuid4
 from urllib.parse import parse_qs
 
+import anyio
 import httpx
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse, StreamingResponse
+from starlette.concurrency import run_in_threadpool
+from starlette.requests import ClientDisconnect
+from starlette.types import ASGIApp, Receive, Scope, Send
 
 # ============================================================
 # CLI Arguments (parsed early so all modules can read them)
@@ -473,6 +479,13 @@ def log_request_diag(
     body: dict,
     forward_body: dict,
 ) -> None:
+    logger.info(
+        "request_start id=%s endpoint=%s model=%s→%s stream=%s content_length=%s",
+        req_id[:8], endpoint, original_model, copilot_model,
+        body.get("stream", False), request.headers.get("content-length", "unknown"),
+    )
+    if not REQUEST_DIAGNOSTICS:
+        return
     body_bytes, body_hash = _json_size_and_hash(body)
     forward_bytes, forward_hash = _json_size_and_hash(forward_body)
     input_value = body.get("input")
@@ -541,6 +554,10 @@ IMAGE_ATTACHMENT_DIR = LOGS_DIR / "image_attachments"
 DATA_IMAGE_RE = re.compile(r"^data:(image/[a-zA-Z0-9.+-]+);base64,(.*)$", re.DOTALL)
 UPSTREAM_BUSY_RETRIES = _int_env("CP4CC_UPSTREAM_BUSY_RETRIES", 2)
 UPSTREAM_BUSY_BACKOFF_SECONDS = _float_env("CP4CC_UPSTREAM_BUSY_BACKOFF_SECONDS", 2.0)
+REQUEST_DIAGNOSTICS = os.environ.get("CP4CC_REQUEST_DIAGNOSTICS", "0") == "1"
+RESPONSES_TOTAL_TIMEOUT = 300.0
+RESPONSES_FIRST_EVENT_TIMEOUT = 120.0
+RESPONSES_HTTP_TIMEOUT = httpx.Timeout(120.0, connect=10.0, write=60.0, pool=10.0)
 
 
 def _is_data_image_url(value) -> bool:
@@ -797,13 +814,17 @@ _audit_data: dict = {
     "started_at": SESSION_START.isoformat(),
     "requests": [],
 }
+_audit_lock = threading.RLock()
 
 
 def _write_audit() -> None:
     if ARGS.fast:
         return
-    with open(AUDIT_FILE, "w", encoding="utf-8") as f:
-        json.dump(_audit_data, f, indent=2, ensure_ascii=False)
+    with _audit_lock:
+        tmp = AUDIT_FILE.with_suffix(".json.tmp")
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(_audit_data, f, indent=2, ensure_ascii=False)
+        os.replace(tmp, AUDIT_FILE)
 
 
 def _parse_ts(value: str) -> datetime | None:
@@ -1197,8 +1218,9 @@ def audit_log(
         "duration_ms": round(duration_ms, 1),
         "error": error,
     }
-    _audit_data["requests"].append(entry)
-    _write_audit()
+    with _audit_lock:
+        _audit_data["requests"].append(entry)
+        _write_audit()
     logger.info(
         "request id=%s model=%s→%s endpoint=%s status=%s duration=%.0fms%s",
         req_id[:8], entry["original_model"], copilot_model, endpoint,
@@ -1290,7 +1312,15 @@ def get_access_token() -> str:
     return token
 
 
+_api_key_lock = threading.RLock()
+
+
 def get_api_key_info() -> dict:
+    with _api_key_lock:
+        return _get_api_key_info_locked()
+
+
+def _get_api_key_info_locked() -> dict:
     """Return the current Copilot API key response, refreshing it when expired."""
     _ensure_token_dir()
     try:
@@ -1303,18 +1333,18 @@ def get_api_key_info() -> dict:
 
     access_token = get_access_token()
     headers = _get_github_request_headers(access_token)
-    client = httpx.Client()
-    resp = client.get(GITHUB_API_KEY_URL, headers=headers)
-
-    if resp.status_code == 401:
-        logger.warning("access_token has expired, re-authenticating")
-        try:
-            os.remove(ACCESS_TOKEN_FILE)
-        except OSError:
-            pass
-        access_token = get_access_token()
-        headers = _get_github_request_headers(access_token)
+    with httpx.Client(timeout=10) as client:
         resp = client.get(GITHUB_API_KEY_URL, headers=headers)
+
+        if resp.status_code == 401:
+            logger.warning("access_token has expired, re-authenticating")
+            try:
+                os.remove(ACCESS_TOKEN_FILE)
+            except OSError:
+                pass
+            access_token = get_access_token()
+            headers = _get_github_request_headers(access_token)
+            resp = client.get(GITHUB_API_KEY_URL, headers=headers)
 
     resp.raise_for_status()
     info = resp.json()
@@ -1470,7 +1500,7 @@ def _initialize_responses_bindings_db() -> str:
             return db_file
 
         _ensure_token_dir()
-        with sqlite3.connect(db_file, timeout=30) as conn:
+        with closing(sqlite3.connect(db_file, timeout=5)) as conn, conn:
             conn.execute("PRAGMA journal_mode=WAL")
             conn.execute("PRAGMA synchronous=NORMAL")
             conn.execute(
@@ -1525,10 +1555,10 @@ def _migrate_legacy_responses_bindings(conn: sqlite3.Connection) -> int:
     try:
         with open(RESPONSES_BINDINGS_FILE, encoding="utf-8") as f:
             legacy = json.load(f)
-    except (IOError, json.JSONDecodeError):
+    except FileNotFoundError:
         return 0
     if not isinstance(legacy, dict):
-        return 0
+        raise ValueError("Legacy Responses bindings must be a JSON object")
 
     now_ts = time.time()
     rows = []
@@ -1573,8 +1603,8 @@ def bind_encrypted_content_hashes(hashes: set[str], api_key_info: dict) -> None:
     safe_info = _safe_api_key_info(api_key_info)
     try:
         expires_at = float(safe_info.get("expires_at", 0))
-    except (TypeError, ValueError):
-        return
+    except (TypeError, ValueError) as exc:
+        raise ValueError("Invalid Responses binding expiry") from exc
     now_ts = time.time()
     if not safe_info.get("token") or expires_at <= now_ts:
         return
@@ -1586,7 +1616,7 @@ def bind_encrypted_content_hashes(hashes: set[str], api_key_info: dict) -> None:
         for digest in hashes
     ]
     db_file = _initialize_responses_bindings_db()
-    with sqlite3.connect(db_file, timeout=30) as conn:
+    with closing(sqlite3.connect(db_file, timeout=5)) as conn, conn:
         conn.execute(
             "DELETE FROM responses_bindings WHERE expires_at <= ?",
             (now_ts,),
@@ -1613,7 +1643,7 @@ def select_api_key_info_for_responses_body(body: dict) -> dict:
     db_file = _initialize_responses_bindings_db()
     digest_list = list(hashes)
     now_ts = time.time()
-    with sqlite3.connect(db_file, timeout=30) as conn:
+    with closing(sqlite3.connect(db_file, timeout=5)) as conn:
         for offset in range(0, len(digest_list), 500):
             chunk = digest_list[offset:offset + 500]
             placeholders = ",".join("?" for _ in chunk)
@@ -1631,9 +1661,10 @@ def select_api_key_info_for_responses_body(body: dict) -> dict:
             try:
                 info = json.loads(row[0])
             except (TypeError, json.JSONDecodeError):
-                continue
+                logger.exception("Invalid Responses binding JSON in SQLite")
+                raise
             if not isinstance(info, dict) or not info.get("token"):
-                continue
+                raise ValueError("Invalid Responses binding in SQLite")
             if api_key_identity(info) != api_key_identity(current):
                 logger.info(
                     "Responses encrypted_content binding selected upstream identity=%s current_identity=%s",
@@ -1966,38 +1997,23 @@ async def stream_openai_to_responses(openai_stream: httpx.Response, response_id:
     yield f"event: response.completed\ndata: {json.dumps(completed)}\n\n"
 
 
-def synthetic_responses_error_events(status_code: int, error_msg: str, response_id: str, model: str, req_id: str) -> list[str]:
-    item_id = f"msg_{uuid4().hex[:24]}"
-    text = (
-        f"cp4cc upstream error {status_code} for request {req_id[:8]}: "
-        f"{error_msg[:800]}"
-    )
-    completed = {
-        "type": "response.completed",
+def synthetic_responses_error_events(status_code: int, error_msg: str, response_id: str, model: str, req_id: str, sequence_number: int = 0) -> list[str]:
+    failed = {
+        "type": "response.failed",
+        "sequence_number": sequence_number,
         "response": {
             "id": response_id,
+            "object": "response",
             "model": model,
-            "status": "completed",
-            "output": [
-                {
-                    "id": item_id,
-                    "type": "message",
-                    "status": "completed",
-                    "role": "assistant",
-                    "content": [{"type": "output_text", "text": text}],
-                }
-            ],
-            "output_text": text,
-            "usage": {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0},
+            "status": "failed",
+            "output": [],
+            "error": {
+                "code": "rate_limit_exceeded" if status_code == 429 else "server_error",
+                "message": f"cp4cc error {status_code} req={req_id[:8]}: {error_msg[:800]}",
+            },
         },
     }
-    return [
-        f"event: response.created\ndata: {json.dumps({'type':'response.created','response':{'id':response_id,'model':model,'status':'in_progress'}})}\n\n",
-        f"event: response.output_item.added\ndata: {json.dumps({'type':'response.output_item.added','output_index':0,'item':{'id':item_id,'type':'message','status':'in_progress','role':'assistant','content':[]}})}\n\n",
-        f"event: response.output_text.delta\ndata: {json.dumps({'type':'response.output_text.delta','delta':text})}\n\n",
-        f"event: response.output_item.done\ndata: {json.dumps({'type':'response.output_item.done','output_index':0,'item':completed['response']['output'][0]})}\n\n",
-        f"event: response.completed\ndata: {json.dumps(completed)}\n\n",
-    ]
+    return [f"event: response.failed\ndata: {json.dumps(failed)}\n\n"]
 
 
 def openai_to_anthropic(openai_resp: dict) -> dict:
@@ -2064,36 +2080,38 @@ async def stream_openai_to_anthropic(
 app = FastAPI(title="GitHub Copilot → Anthropic API Proxy", docs_url=None, redoc_url=None)
 
 
-@app.middleware("http")
-async def _request_lifecycle(request: Request, call_next):
-    """Track every request in the in-flight table so heartbeat can show what
-    was running when the process died, and to log unexpected mid-request aborts."""
-    rid = uuid4().hex[:8]
-    try:
-        size = int(request.headers.get("content-length", "0") or 0)
-    except ValueError:
-        size = 0
-    info = {"path": request.url.path, "method": request.method, "start": time.time(), "size": size}
-    with _inflight_lock:
-        _inflight_requests[rid] = info
-    try:
-        response = await call_next(request)
-        return response
-    except BaseException as exc:
-        _lifecycle(
-            "request_failed",
-            rid=rid,
-            path=info["path"],
-            method=info["method"],
-            content_length=size,
-            duration_s=round(time.time() - info["start"], 2),
-            exc_type=type(exc).__name__,
-            msg=str(exc)[:300],
-        )
-        raise
-    finally:
+class RequestLifecycleMiddleware:
+    def __init__(self, app: ASGIApp):
+        self.app = app
+
+    async def __call__(self, scope: Scope, receive: Receive, send: Send):
+        if scope["type"] != "http":
+            return await self.app(scope, receive, send)
+        req_id = str(uuid4())
+        scope.setdefault("state", {})["request_id"] = req_id
+        rid = req_id[:8]
+        try:
+            size = int(dict(scope.get("headers", [])).get(b"content-length", b"0"))
+        except ValueError:
+            size = 0
+        info = {"path": scope["path"], "method": scope["method"], "start": time.time(), "size": size}
         with _inflight_lock:
-            _inflight_requests.pop(rid, None)
+            _inflight_requests[rid] = info
+        try:
+            await self.app(scope, receive, send)
+        except (Exception, asyncio.CancelledError) as exc:
+            _lifecycle(
+                "request_failed", rid=rid, path=info["path"], method=info["method"],
+                content_length=size, duration_s=round(time.time() - info["start"], 2),
+                exc_type=type(exc).__name__, msg=str(exc)[:300],
+            )
+            raise
+        finally:
+            with _inflight_lock:
+                _inflight_requests.pop(rid, None)
+
+
+app.add_middleware(RequestLifecycleMiddleware)
 
 
 @app.on_event("startup")
@@ -2260,150 +2278,293 @@ async def chat_completions(request: Request):
     return JSONResponse(content=result)
 
 
+class ResponsesFailure(Exception):
+    def __init__(self, status: int, message: str):
+        super().__init__(message)
+        self.status = status
+
+
+@dataclass
+class ResponsesState:
+    req_id: str
+    model: str
+    started: float
+    response_id: str = ""
+    status: int = 500
+    outcome: str = "running"
+    error: str | None = None
+    upstream_status: int | None = None
+    first_event_ms: float | None = None
+    last_event_ms: float | None = None
+    terminal_event: str | None = None
+    sequence_number: int = -1
+    attempts: int = 0
+    usage: dict = field(default_factory=dict)
+    hashes: set[str] = field(default_factory=set)
+    api_key_info: dict = field(default_factory=dict)
+    result: dict | None = None
+
+    def fail(self, status: int, error: str, outcome: str = "failed") -> None:
+        self.status, self.error, self.outcome = status, error, outcome
+        logger.warning("responses_end id=%s outcome=%s status=%d error=%s",
+                       self.req_id[:8], outcome, status, error[:500])
+
+
+_ResponsesResult = TypeVar("_ResponsesResult")
+
+
+async def responses_wait(awaitable: Awaitable[_ResponsesResult], deadline: float) -> _ResponsesResult:
+    try:
+        return await asyncio.wait_for(awaitable, max(0.0, deadline - time.monotonic()))
+    except asyncio.TimeoutError as exc:
+        raise ResponsesFailure(504, "Responses waiting deadline exceeded") from exc
+
+
+def refresh_responses_key(req_id: str) -> dict:
+    with _api_key_lock:
+        invalidate_api_key_cache(f"Responses req={req_id[:8]} token expired")
+        return get_api_key_info()
+
+
+@asynccontextmanager
+async def open_responses_upstream(body: dict, state: ResponsesState, deadline: float) -> AsyncIterator[httpx.Response]:
+    auth_retries = encrypted_retries = busy_retries = 0
+    async with httpx.AsyncClient(timeout=RESPONSES_HTTP_TIMEOUT) as client:
+        while True:
+            state.attempts += 1
+            content = await responses_wait(
+                asyncio.to_thread(lambda: json.dumps(body, ensure_ascii=False, separators=(",", ":")).encode()),
+                deadline,
+            )
+            manager = client.stream(
+                "POST", f"{get_api_base(state.api_key_info)}/v1/responses",
+                headers=get_copilot_headers(state.api_key_info["token"]), content=content,
+            )
+            response = await responses_wait(manager.__aenter__(), deadline)
+            delay = 0
+            try:
+                state.upstream_status = response.status_code
+                if response.status_code == 200:
+                    yield response
+                    return
+                error_body = await responses_wait(response.aread(), deadline)
+                error = error_body.decode("utf-8", errors="replace")
+                if auth_retries == 0 and is_expired_ide_token_error(response.status_code, error):
+                    auth_retries += 1
+                    state.api_key_info = await responses_wait(
+                        asyncio.to_thread(refresh_responses_key, state.req_id), deadline,
+                    )
+                elif encrypted_retries == 0 and is_invalid_encrypted_content_error(response.status_code, error):
+                    encrypted_retries += 1
+                    body = await responses_wait(asyncio.to_thread(strip_encrypted_content_fields, body), deadline)
+                elif busy_retries < UPSTREAM_BUSY_RETRIES and is_retryable_upstream_error(response.status_code, error):
+                    busy_retries += 1
+                    delay = upstream_busy_retry_delay(busy_retries)
+                else:
+                    raise ResponsesFailure(response.status_code, error or f"Upstream HTTP {response.status_code}")
+                logger.warning("Responses retry req=%s upstream_status=%d attempt=%d delay_s=%.1f",
+                               state.req_id[:8], response.status_code, state.attempts, delay)
+            finally:
+                with anyio.CancelScope(shield=True):
+                    await manager.__aexit__(None, None, None)
+            if delay:
+                await responses_wait(asyncio.sleep(delay), deadline)
+
+
+async def iter_responses_events(response: httpx.Response, deadline: float, first_deadline: float) -> AsyncIterator[tuple[str, dict | None]]:
+    lines = response.aiter_lines().__aiter__()
+    frame: list[str] = []
+    saw_event = False
+    while True:
+        try:
+            line = await responses_wait(
+                lines.__anext__(), deadline if saw_event else min(deadline, first_deadline),
+            )
+        except StopAsyncIteration:
+            if frame:
+                raise ResponsesFailure(502, "Upstream closed in the middle of an SSE event")
+            return
+        if line:
+            frame.append(line)
+            continue
+        if not frame:
+            continue
+        raw = "\n".join(frame) + "\n\n"
+        data = "\n".join(line[5:].removeprefix(" ") for line in frame if line.startswith("data:"))
+        event_name = next((line[6:].strip() for line in frame if line.startswith("event:")), "")
+        frame = []
+        if not data:
+            yield raw, None
+            continue
+        if data == "[DONE]":
+            return
+        try:
+            payload = json.loads(data)
+        except json.JSONDecodeError as exc:
+            raise ResponsesFailure(502, "Invalid upstream SSE JSON") from exc
+        if not isinstance(payload, dict):
+            raise ResponsesFailure(502, "Upstream SSE data must be an object")
+        if not payload.get("type") and event_name:
+            payload["type"] = event_name
+        saw_event = True
+        yield raw, payload
+
+
+async def finalize_responses(body: dict, state: ResponsesState) -> None:
+    with anyio.CancelScope(shield=True):
+        persistence_error = None
+        if state.outcome == "completed" and state.hashes:
+            try:
+                await run_in_threadpool(bind_encrypted_content_hashes, state.hashes, state.api_key_info)
+            except (OSError, ValueError, sqlite3.Error) as exc:
+                persistence_error = f"{type(exc).__name__}: {exc}"
+                logger.exception("Responses binding persistence failed req=%s", state.req_id[:8])
+        summary = state.result if state.result is not None else {
+            "stream": body.get("stream", False), "usage": state.usage,
+            "outcome": state.outcome, "upstream_status": state.upstream_status,
+            "first_event_ms": state.first_event_ms, "last_event_ms": state.last_event_ms,
+            "terminal_event": state.terminal_event, "attempts": state.attempts,
+            "persistence_error": persistence_error,
+        }
+        try:
+            await run_in_threadpool(
+                audit_log, state.req_id, body, state.model, "/v1/responses", summary,
+                state.status, (time.monotonic() - state.started) * 1000, state.error,
+            )
+        except (OSError, ValueError) as exc:
+            logger.exception("Responses audit failed req=%s: %s", state.req_id[:8], type(exc).__name__)
+            raise
+
+
+class AuditedResponsesStream(StreamingResponse):
+    def __init__(self, content: AsyncGenerator[str, None], body: dict, state: ResponsesState):
+        super().__init__(content, media_type="text/event-stream", headers={
+            "Cache-Control": "no-cache", "X-Accel-Buffering": "no", "X-Request-ID": state.req_id,
+        })
+        self.request_body = body
+        self.response_state = state
+        self.stream_iterator = content
+
+    async def __call__(self, scope: Scope, receive: Receive, send: Send):
+        try:
+            await super().__call__(scope, receive, send)
+        except (ClientDisconnect, asyncio.CancelledError):
+            raise
+        except Exception as exc:
+            self.response_state.fail(500, f"{type(exc).__name__}: {exc}")
+            logger.exception("Unexpected Responses stream failure req=%s", self.response_state.req_id[:8])
+            raise
+        finally:
+            with anyio.CancelScope(shield=True):
+                if self.response_state.outcome == "running":
+                    self.response_state.fail(499, "Client disconnected before terminal event", "cancelled")
+                try:
+                    await self.stream_iterator.aclose()
+                finally:
+                    await finalize_responses(self.request_body, self.response_state)
+
+
+async def generate_responses(body: dict, state: ResponsesState, deadline: float) -> AsyncGenerator[str, None]:
+    first_deadline = min(deadline, time.monotonic() + RESPONSES_FIRST_EVENT_TIMEOUT)
+    try:
+        async with open_responses_upstream(body, state, min(deadline, first_deadline)) as response:
+            async for raw, payload in iter_responses_events(response, deadline, first_deadline):
+                if payload is not None:
+                    elapsed = round((time.monotonic() - state.started) * 1000, 1)
+                    if state.first_event_ms is None:
+                        state.first_event_ms = elapsed
+                        logger.info("responses_first_event id=%s elapsed_ms=%.1f", state.req_id[:8], elapsed)
+                    state.last_event_ms = elapsed
+                    event = payload.get("type")
+                    upstream = payload.get("response")
+                    if isinstance(upstream, dict):
+                        if isinstance(upstream.get("id"), str):
+                            state.response_id = upstream["id"]
+                        state.usage.update(_extract_usage(upstream))
+                    if isinstance(payload.get("sequence_number"), int):
+                        state.sequence_number = payload["sequence_number"]
+                    if event in ("response.output_item.done", "response.completed"):
+                        state.hashes.update(collect_encrypted_content_hashes(payload))
+                    if event in ("response.completed", "response.failed", "response.incomplete", "error"):
+                        state.terminal_event = event
+                        if event == "response.completed":
+                            state.status, state.outcome = 200, "completed"
+                        else:
+                            details = (upstream or {}).get("error") if isinstance(upstream, dict) else None
+                            details = details or payload.get("error") or payload.get("message") or event
+                            state.fail(502, json.dumps(details, ensure_ascii=False), "incomplete" if event == "response.incomplete" else "failed")
+                        yield raw
+                        return
+                yield raw
+        raise ResponsesFailure(502, "Upstream stream closed before a terminal Responses event")
+    except (ResponsesFailure, httpx.HTTPError, OSError, ValueError, sqlite3.Error) as exc:
+        status = exc.status if isinstance(exc, ResponsesFailure) else 504 if isinstance(exc, httpx.TimeoutException) else 502
+        state.fail(status, f"{type(exc).__name__}: {exc}")
+        state.terminal_event = "response.failed"
+        yield synthetic_responses_error_events(
+            status, state.error, state.response_id, state.model, state.req_id, state.sequence_number + 1,
+        )[0]
+
+
 @app.post("/v1/responses")
 async def responses(request: Request):
-    req_id = str(uuid4())
-    t_start = time.monotonic()
+    req_id = getattr(request.state, "request_id", str(uuid4()))
+    started = time.monotonic()
     try:
         body = await request.json()
-    except json.JSONDecodeError as e:
-        logger.warning("Invalid Responses JSON request req=%s: %s", req_id[:8], e)
-        raise HTTPException(status_code=400, detail="Invalid JSON body.")
-
+    except json.JSONDecodeError as exc:
+        logger.warning("Invalid Responses JSON req=%s: %s", req_id[:8], exc)
+        raise HTTPException(status_code=400, detail="Invalid JSON body.") from exc
+    if not isinstance(body, dict):
+        logger.warning("Invalid Responses body type req=%s", req_id[:8])
+        raise HTTPException(status_code=400, detail="Request body must be a JSON object.")
     body["_source"] = source_from_request(request)
-    original_model: str = body.get("model", "")
-    copilot_model = map_model_name(original_model)
-    raw_forward_body = upstream_body(body, copilot_model)
-    forward_body, image_sanitize_report = sanitize_responses_payload(raw_forward_body)
-
+    state = ResponsesState(req_id, map_model_name(body.get("model", "")), started,
+                           response_id=f"resp_{req_id.replace('-', '')[:24]}")
+    deadline = started + RESPONSES_TOTAL_TIMEOUT
+    stream_response = None
     try:
-        api_key_info = select_api_key_info_for_responses_body(forward_body)
-        api_key = api_key_info["token"]
-    except Exception as e:
-        logger.error("Authentication failed req=%s: %s", req_id[:8], e)
-        audit_log(req_id, body, copilot_model, "responses-auth", None, 401, 0, str(e))
-        raise HTTPException(status_code=401, detail=f"GitHub Copilot authentication failed: {e}")
-
-    api_base = get_api_base(api_key_info)
-    copilot_headers = get_copilot_headers(api_key)
-    endpoint = "/v1/responses"
-    is_stream = forward_body.get("stream", False)
-    url = f"{api_base}{endpoint}"
-    log_request_diag(req_id, endpoint, original_model, copilot_model, request, body, forward_body)
-    if image_sanitize_report.get("omitted"):
-        logger.info(
-            "responses req=%s image_sanitize=%s",
-            req_id[:8],
-            json.dumps(image_sanitize_report, ensure_ascii=False, separators=(",", ":")),
+        forward_body, report = await responses_wait(
+            asyncio.to_thread(sanitize_responses_payload, upstream_body(body, state.model)), deadline,
         )
-
-    logger.debug(
-        "responses req=%s model=%s→%s endpoint=%s stream=%s",
-        req_id[:8], original_model, copilot_model, endpoint, is_stream,
-    )
-
-    if is_stream:
-        async def generate():
-            nonlocal t_start
-            error_msg = None
-            status = 200
-            usage = {}
-            response_encrypted_hashes: set[str] = set()
-            auth_retry_count = 0
-            busy_retry_count = 0
-            encrypted_retry_count = 0
-            target_url = url
-            headers = copilot_headers
-            request_body = forward_body
-            try:
-                while True:
-                    async with httpx.AsyncClient(timeout=120) as client:
-                        async with client.stream("POST", target_url, headers=headers, json=request_body) as resp:
-                            status = resp.status_code
-                            if status != 200:
-                                err = await resp.aread()
-                                error_msg = err.decode()
-                                if auth_retry_count == 0 and is_expired_ide_token_error(status, error_msg):
-                                    auth_retry_count += 1
-                                    logger.warning("Upstream %s req=%s returned expired token; refreshing and retrying once", endpoint, req_id[:8])
-                                    target_url, headers = refresh_upstream_auth_after_401(req_id, endpoint, error_msg)
-                                    continue
-                                if encrypted_retry_count == 0 and is_invalid_encrypted_content_error(status, error_msg):
-                                    encrypted_retry_count += 1
-                                    logger.warning("Upstream %s req=%s could not decrypt encrypted_content; retrying once without encrypted_content", endpoint, req_id[:8])
-                                    request_body = strip_encrypted_content_fields(request_body)
-                                    continue
-                                if busy_retry_count < UPSTREAM_BUSY_RETRIES and is_retryable_upstream_error(status, error_msg):
-                                    busy_retry_count += 1
-                                    delay = upstream_busy_retry_delay(busy_retry_count)
-                                    logger.warning("Upstream %s req=%s returned retryable %s; retrying same model in %.1fs (%d/%d)", endpoint, req_id[:8], status, delay, busy_retry_count, UPSTREAM_BUSY_RETRIES)
-                                    await asyncio.sleep(delay)
-                                    continue
-                                logger.warning("Upstream %s req=%s returned %s: %s", endpoint, req_id[:8], status, error_msg[:200])
-                                for event in synthetic_responses_error_events(status, error_msg, f"resp_{req_id.replace('-', '')[:24]}", copilot_model, req_id):
-                                    yield event
-                            else:
-                                error_msg = None
-                                async for line in resp.aiter_lines():
-                                    if line:
-                                        update_usage_from_sse_line(line, usage)
-                                        update_encrypted_hashes_from_sse_line(line, response_encrypted_hashes)
-                                        yield line + "\n"
-                                    else:
-                                        yield "\n"
-                            break
-            except Exception as e:
-                error_msg = str(e)
-                logger.error("Responses streaming request error req=%s: %s", req_id[:8], e)
-            if status == 200 and response_encrypted_hashes:
-                bind_encrypted_content_hashes(response_encrypted_hashes, api_key_info)
-            duration = (time.monotonic() - t_start) * 1000
-            audit_log(req_id, body, copilot_model, "/v1/responses", {"stream": True, "usage": usage}, status, duration, error_msg)
-
-        return StreamingResponse(
-            generate(),
-            media_type="text/event-stream",
-            headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+        state.model = forward_body.get("model", state.model)
+        state.api_key_info = await responses_wait(
+            asyncio.to_thread(select_api_key_info_for_responses_body, forward_body), deadline,
         )
-
-    try:
-        async with httpx.AsyncClient(timeout=120) as client:
-            target_url = url
-            headers = copilot_headers
-            request_body = forward_body
-            resp = await client.post(target_url, headers=headers, json=request_body)
-            if is_expired_ide_token_error(resp.status_code, resp.text):
-                logger.warning("Upstream %s req=%s returned expired token; refreshing and retrying once", endpoint, req_id[:8])
-                target_url, headers = refresh_upstream_auth_after_401(req_id, endpoint, resp.text)
-                resp = await client.post(target_url, headers=headers, json=request_body)
-            if is_invalid_encrypted_content_error(resp.status_code, resp.text):
-                logger.warning("Upstream %s req=%s could not decrypt encrypted_content; retrying once without encrypted_content", endpoint, req_id[:8])
-                request_body = strip_encrypted_content_fields(request_body)
-                resp = await client.post(target_url, headers=headers, json=request_body)
-            busy_retry_count = 0
-            while busy_retry_count < UPSTREAM_BUSY_RETRIES and is_retryable_upstream_error(resp.status_code, resp.text):
-                busy_retry_count += 1
-                delay = upstream_busy_retry_delay(busy_retry_count)
-                logger.warning("Upstream %s req=%s returned retryable %s; retrying same model in %.1fs (%d/%d)", endpoint, req_id[:8], resp.status_code, delay, busy_retry_count, UPSTREAM_BUSY_RETRIES)
-                await asyncio.sleep(delay)
-                resp = await client.post(target_url, headers=headers, json=request_body)
-    except Exception as e:
-        duration = (time.monotonic() - t_start) * 1000
-        audit_log(req_id, body, copilot_model, "/v1/responses", None, 500, duration, str(e))
-        raise HTTPException(status_code=500, detail=str(e))
-
-    duration = (time.monotonic() - t_start) * 1000
-    if resp.status_code != 200:
-        logger.warning("Upstream %s req=%s returned %s: %s", endpoint, req_id[:8], resp.status_code, resp.text[:300])
-        audit_log(req_id, body, copilot_model, "/v1/responses", resp.text[:500], resp.status_code, duration, f"upstream {resp.status_code}")
-        raise HTTPException(status_code=resp.status_code, detail=resp.text)
-
-    result = resp.json()
-    response_encrypted_hashes = collect_encrypted_content_hashes(result)
-    if response_encrypted_hashes:
-        bind_encrypted_content_hashes(response_encrypted_hashes, api_key_info)
-    audit_log(req_id, body, copilot_model, "/v1/responses", result, 200, duration)
-    return JSONResponse(content=result)
+        await responses_wait(
+            asyncio.to_thread(log_request_diag, req_id, "/v1/responses", body.get("model", ""),
+                              state.model, request, body, forward_body), deadline,
+        )
+        if report.get("omitted"):
+            logger.info("responses req=%s image_sanitize=%s", req_id[:8], json.dumps(report))
+        if forward_body.get("stream", False):
+            stream_response = AuditedResponsesStream(
+                generate_responses(forward_body, state, deadline), body, state,
+            )
+            return stream_response
+        async with open_responses_upstream(forward_body, state, deadline) as response:
+            await responses_wait(response.aread(), deadline)
+            result = await responses_wait(asyncio.to_thread(response.json), deadline)
+        if not isinstance(result, dict):
+            raise ResponsesFailure(502, "Upstream response must be a JSON object")
+        state.result = result
+        if result.get("error") or result.get("status") in ("failed", "incomplete"):
+            raise ResponsesFailure(502, json.dumps(result.get("error") or result.get("incomplete_details") or result.get("status")))
+        state.hashes = collect_encrypted_content_hashes(result)
+        state.status, state.outcome = 200, "completed"
+        return JSONResponse(content=result, headers={"X-Request-ID": req_id})
+    except (asyncio.CancelledError, ClientDisconnect):
+        state.fail(499, "Client disconnected", "cancelled")
+        raise
+    except (ResponsesFailure, httpx.HTTPError, OSError, ValueError, sqlite3.Error) as exc:
+        status = exc.status if isinstance(exc, ResponsesFailure) else 504 if isinstance(exc, httpx.TimeoutException) else 502
+        state.fail(status, f"{type(exc).__name__}: {exc}")
+        raise HTTPException(status_code=status, detail=state.error) from exc
+    finally:
+        if stream_response is None:
+            if state.outcome == "running":
+                state.fail(500, "Unexpected Responses request failure")
+            await finalize_responses(body, state)
 
 
 @app.post("/v1/messages")
