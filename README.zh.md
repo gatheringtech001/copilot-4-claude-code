@@ -148,7 +148,14 @@ Claude Code 的模型名称会自动转换为 Copilot 格式：
 120 秒。连接和上传超时分别为 10 秒和 60 秒。此预算针对单次代理请求，不是整个
 Codex 任务；客户端仍可能自行重试失败的请求。非流式 Responses 请求共享总预算及重试规则。
 
-正常 SSE 帧原样转发，收到终止事件后立即关闭上游连接，不等待额外 EOF。
+item ID 一致的 SSE 帧原样转发。Copilot 同一输出项的 ID 随事件变化时，代理按
+`output_index` 保留首次出现的 item ID，统一 item、content、文本/推理/工具事件及
+response output 快照中的引用，避免 Codex 将完成快照追加为第二条消息。
+映射仅在单次请求内有效，不修改 response ID、工具 `call_id`、正文、encrypted content
+或事件序号；仅重新序列化需要修复的 SSE data，保留注释及其他 SSE 字段。
+首次修复会记录日志，审计记录 `item_id_normalizations` 修复次数。
+
+收到终止事件后立即关闭上游连接，不等待额外 EOF。
 截断或格式错误的流、网络异常和等待超时会明确返回 `response.failed`，不再伪造正常助手回复
 或 `response.completed`。已开始转发输出后，代理不会重新发送生成请求。
 

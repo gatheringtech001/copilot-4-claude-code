@@ -2285,6 +2285,56 @@ class ResponsesFailure(Exception):
 
 
 @dataclass
+class ResponsesItemIdentity:
+    ids: dict[int, str] = field(default_factory=dict)
+
+    def normalize(self, payload: dict) -> int:
+        if not str(payload.get("type", "")).startswith("response."):
+            return 0
+        changes = 0
+
+        def rewrite(value: dict, key: str, index: int) -> None:
+            nonlocal changes
+            item_id = value.get(key)
+            if not isinstance(item_id, str) or not item_id:
+                return
+            canonical = self.ids.setdefault(index, item_id)
+            if item_id != canonical:
+                value[key] = canonical
+                changes += 1
+
+        index = payload.get("output_index")
+        if type(index) is int and index >= 0:
+            item = payload.get("item")
+            if isinstance(item, dict):
+                rewrite(item, "id", index)
+            rewrite(payload, "item_id", index)
+
+        response = payload.get("response")
+        output = response.get("output") if isinstance(response, dict) else None
+        if isinstance(output, list):
+            # A Responses snapshot's output positions are the stream output_index.
+            for index, item in enumerate(output):
+                if isinstance(item, dict):
+                    rewrite(item, "id", index)
+        return changes
+
+
+def rewrite_responses_sse_data(raw: str, payload: dict) -> str:
+    data_line = "data: " + json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
+    lines = []
+    written = False
+    for line in raw.split("\n"):
+        if line.startswith("data:"):
+            if not written:
+                lines.append(data_line)
+                written = True
+        else:
+            lines.append(line)
+    return "\n".join(lines)
+
+
+@dataclass
 class ResponsesState:
     req_id: str
     model: str
@@ -2303,6 +2353,7 @@ class ResponsesState:
     hashes: set[str] = field(default_factory=set)
     api_key_info: dict = field(default_factory=dict)
     result: dict | None = None
+    item_id_normalizations: int = 0
 
     def fail(self, status: int, error: str, outcome: str = "failed") -> None:
         self.status, self.error, self.outcome = status, error, outcome
@@ -2424,6 +2475,7 @@ async def finalize_responses(body: dict, state: ResponsesState) -> None:
             "outcome": state.outcome, "upstream_status": state.upstream_status,
             "first_event_ms": state.first_event_ms, "last_event_ms": state.last_event_ms,
             "terminal_event": state.terminal_event, "attempts": state.attempts,
+            "item_id_normalizations": state.item_id_normalizations,
             "persistence_error": persistence_error,
         }
         try:
@@ -2466,10 +2518,18 @@ class AuditedResponsesStream(StreamingResponse):
 
 async def generate_responses(body: dict, state: ResponsesState, deadline: float) -> AsyncGenerator[str, None]:
     first_deadline = min(deadline, time.monotonic() + RESPONSES_FIRST_EVENT_TIMEOUT)
+    identities = ResponsesItemIdentity()
     try:
         async with open_responses_upstream(body, state, min(deadline, first_deadline)) as response:
             async for raw, payload in iter_responses_events(response, deadline, first_deadline):
                 if payload is not None:
+                    changes = identities.normalize(payload)
+                    if changes:
+                        if state.item_id_normalizations == 0:
+                            logger.warning("Responses upstream item IDs changed; normalizing by output_index req=%s",
+                                           state.req_id[:8])
+                        state.item_id_normalizations += changes
+                        raw = rewrite_responses_sse_data(raw, payload)
                     elapsed = round((time.monotonic() - state.started) * 1000, 1)
                     if state.first_event_ms is None:
                         state.first_event_ms = elapsed

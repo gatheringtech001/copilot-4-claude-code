@@ -155,6 +155,152 @@ def test_multiline_sse_and_comments_preserve_framing(proxy, monkeypatch):
     assert audits[0]["status"] == 200
 
 
+def test_changing_message_ids_are_normalized_through_completion(proxy, monkeypatch):
+    module, audits = proxy
+    chunks = [
+        CREATED,
+        sse("response.output_item.added", output_index=0, item={
+            "id": "msg_added", "type": "message", "content": [], "phase": "final_answer",
+        }),
+        sse("response.content_part.added", output_index=0, item_id="msg_part",
+            content_index=0, part={"type": "output_text", "text": ""}),
+        sse("response.output_text.delta", output_index=0, item_id="msg_delta",
+            content_index=0, delta="OK", sequence_number=8),
+        sse("response.output_text.done", output_index=0, item_id="msg_text_done", text="OK"),
+        sse("response.content_part.done", output_index=0, item_id="msg_part_done",
+            part={"type": "output_text", "text": "OK"}),
+        sse("response.output_item.done", output_index=0, item={
+            "id": "msg_done", "type": "message",
+            "content": [{"type": "output_text", "text": "OK"}], "phase": "final_answer",
+        }),
+        sse("response.completed", response={
+            "id": "resp_final", "status": "completed", "output": [{
+                "id": "msg_snapshot", "type": "message",
+                "content": [{"type": "output_text", "text": "OK"}], "phase": "final_answer",
+            }],
+        }),
+    ]
+    install_upstream(monkeypatch, module, lambda _: httpx.Response(200, stream=UpstreamStream(chunks)))
+    result = events(post(module))
+    assert result[0]["response"]["id"] == "resp_upstream"
+    assert result[-1]["response"]["id"] == "resp_final"
+    for event in result:
+        if "item_id" in event:
+            assert event["item_id"] == "msg_added"
+        if "item" in event:
+            assert event["item"]["id"] == "msg_added"
+    assert result[-1]["response"]["output"][0]["id"] == "msg_added"
+    assert result[-1]["response"]["output"][0]["phase"] == "final_answer"
+    assert "".join(e.get("delta", "") for e in result) == "OK"
+    assert result[3]["sequence_number"] == 8
+    assert audits[0]["body"]["item_id_normalizations"] == 6
+    assert audits[0]["status"] == 200
+
+
+@pytest.mark.parametrize("terminal", ["response.completed", "response.failed", "response.incomplete"])
+def test_multiple_items_keep_distinct_ids_and_tool_call_identity(proxy, monkeypatch, terminal):
+    module, audits = proxy
+    reasoning = {"id": "reasoning_first", "type": "reasoning", "encrypted_content": "cipher"}
+    tool = {"id": "tool_first", "type": "function_call", "call_id": "call_stable",
+            "name": "read_file", "arguments": ""}
+    message = {"id": "message_first", "type": "message", "content": []}
+    chunks = [
+        sse("response.output_item.added", output_index=0, item=reasoning),
+        sse("response.output_item.added", output_index=1, item=tool),
+        sse("response.output_item.added", output_index=2, item=message),
+        sse("response.function_call_arguments.delta", output_index=1,
+            item_id="tool_delta", delta='{"path":"test"}'),
+        sse("response.reasoning_summary_text.delta", output_index=0,
+            item_id="reasoning_delta", delta="Thinking"),
+        sse("response.output_text.delta", output_index=2,
+            item_id="message_delta", delta="OK"),
+        sse(terminal, response={"id": "resp_final", "status": terminal.split(".")[-1],
+            "output": [
+                {**reasoning, "id": "reasoning_final"},
+                {**tool, "id": "tool_final", "arguments": '{"path":"test"}'},
+                {**message, "id": "message_final"},
+            ]}),
+    ]
+    install_upstream(monkeypatch, module, lambda _: httpx.Response(200, stream=UpstreamStream(chunks)))
+    result = events(post(module))
+    assert [result[i]["item_id"] for i in (3, 4, 5)] == [
+        "tool_first", "reasoning_first", "message_first",
+    ]
+    output = result[-1]["response"]["output"]
+    assert [item["id"] for item in output] == ["reasoning_first", "tool_first", "message_first"]
+    assert output[0]["encrypted_content"] == "cipher"
+    assert output[1]["call_id"] == "call_stable"
+    assert output[1]["arguments"] == '{"path":"test"}'
+    assert audits[0]["body"]["item_id_normalizations"] == 6
+
+
+def test_consistent_item_ids_preserve_raw_multiline_frames(proxy, monkeypatch):
+    module, audits = proxy
+    raw = (b': ping\nid: sse_cursor\nretry: 1234\nevent: response.output_item.added\n'
+           b'data: {"type":"response.output_item.added","output_index":0,\n'
+           b'data: "item":{"id":"msg_stable","type":"message"}}\n\n')
+    completed = sse("response.completed", response={
+        "id": "resp_done", "status": "completed", "output": [{"id": "msg_stable", "type": "message"}],
+    })
+    install_upstream(monkeypatch, module, lambda _: httpx.Response(200, stream=UpstreamStream([raw, completed])))
+    assert post(module).content == raw + completed
+    assert audits[0]["body"]["item_id_normalizations"] == 0
+
+
+def test_rewritten_multiline_frame_preserves_sse_fields(proxy, monkeypatch):
+    module, _ = proxy
+    added = sse("response.output_item.added", output_index=0, item={"id": "first", "type": "message"})
+    raw = (b': comment\nid: cursor\nretry: 1234\nevent: response.output_text.delta\n'
+           b'data: {"type":"response.output_text.delta","output_index":0,\n'
+           b'data: "item_id":"changed","content_index":0,"delta":"hello"}\n\n')
+    install_upstream(monkeypatch, module, lambda _: httpx.Response(
+        200, stream=UpstreamStream([added, raw[:100], raw[100:], COMPLETED]),
+    ))
+    response = post(module)
+    assert ': comment\nid: cursor\nretry: 1234\nevent: response.output_text.delta\n' in response.text
+    assert events(response)[1]["item_id"] == "first"
+    assert events(response)[1]["delta"] == "hello"
+
+
+def test_item_ids_are_scoped_to_each_request(proxy, monkeypatch):
+    module, _ = proxy
+    calls = []
+
+    def handler(request):
+        calls.append(request)
+        item_id = f"msg_request_{len(calls)}"
+        return httpx.Response(200, stream=UpstreamStream([
+            sse("response.output_item.added", output_index=0, item={"id": item_id}),
+            sse("response.completed", response={"status": "completed", "output": [{"id": "changed"}]}),
+        ]))
+
+    install_upstream(monkeypatch, module, handler)
+    for number in (1, 2):
+        result = events(post(module))
+        assert result[-1]["response"]["output"][0]["id"] == f"msg_request_{number}"
+
+
+def test_identity_can_start_at_delta_or_snapshot_and_ignores_unindexed_events(proxy):
+    module, _ = proxy
+    identities = module.ResponsesItemIdentity()
+    assert identities.normalize({
+        "type": "response.output_text.delta", "output_index": 3, "item_id": "delta_first",
+    }) == 0
+    done = {"type": "response.output_item.done", "output_index": 3, "item": {"id": "done"}}
+    assert identities.normalize(done) == 1
+    assert done["item"]["id"] == "delta_first"
+    snapshot = {"type": "response.in_progress", "response": {"output": [{"id": "snapshot_first"}]}}
+    assert identities.normalize(snapshot) == 0
+    added = {"type": "response.output_item.added", "output_index": 0, "item": {"id": "added"}}
+    assert identities.normalize(added) == 1
+    assert added["item"]["id"] == "snapshot_first"
+    for index in (None, -1, "0", True):
+        event = {"type": "response.output_text.delta", "output_index": index, "item_id": "untouched"}
+        assert identities.normalize(event) == 0
+        assert event["item_id"] == "untouched"
+    assert identities.normalize({"type": "custom.event", "output_index": 0, "item_id": "untouched"}) == 0
+
+
 def test_terminal_http_error_is_not_synthetic_success(proxy, monkeypatch):
     module, audits = proxy
     install_upstream(monkeypatch, module, lambda _: httpx.Response(413, json={"error": {"message": "too large"}}))

@@ -148,7 +148,16 @@ authentication and upstream retries. The first SSE event must arrive within
 These limits apply per proxy request, not to a complete Codex turn: a client may
 still choose to retry failed requests.
 
-Normal SSE frames are forwarded without rewriting. A terminal event closes the
+SSE frames with consistent item IDs are forwarded without rewriting. For Copilot
+streams whose item IDs change between events, the proxy retains the first item ID
+for each `output_index` across item, content, text/reasoning/tool events and response
+output snapshots. This prevents Codex from treating a completion snapshot as a
+second message. IDs are scoped to one request; response IDs, tool `call_id` values,
+text, encrypted content and sequence numbers are not changed. Only affected SSE
+data is reserialized; comments and other SSE fields are preserved. The first repair
+is logged and the audit records the `item_id_normalizations` count.
+
+A terminal event closes the
 upstream connection immediately. Truncated/malformed streams, transport errors
 and deadline expiry produce `response.failed`, never a fabricated successful
 assistant response. Requests are not replayed by the proxy after output begins.
